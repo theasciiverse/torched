@@ -1,6 +1,6 @@
 [package]
 name = "torched"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Artillery on destructible ground in the terminal, after Xscorch"
 license = "GPL-2.0-only"

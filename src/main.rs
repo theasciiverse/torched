@@ -1,8 +1,10 @@
 //! Torched: artillery on destructible ground, after Xscorch.
 
 mod land;
+mod physics;
 mod render;
 mod sim;
+mod weapons;
 
 use std::{
     fs,
@@ -16,7 +18,9 @@ use log::{LevelFilter, info};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use land::Generator;
+use physics::Walls;
 use sim::{Config, Game, Phase};
+use weapons::Arsenal;
 
 const TICK: Duration = Duration::from_micros(16_667);
 
@@ -30,21 +34,27 @@ Usage: torched [options]
   --terrain NAME   none, canyon, double-mountain, hillside, mountain,
                    plains, traditional, valley, or random (default)
   --bumpiness N    0 to 100 (default 50)
+  --walls KIND     concrete, padded, rubber, spring, wrap (default),
+                   none, or random
+  --wind N         strongest wind, 0 to 10 (default 0.05)
+  --steady-wind    wind stays the same all round
+  --viscosity N    air drag, 0 to 0.2 (default 0)
+  --weapons FILE   weapons from a weapons.def file
   --seed N         fix the random seed
   -h, --help       this help
   -V, --version    version
 
 Keys: arrows aim (Shift for big steps), PgUp/PgDn power by 20,
-      Space or Enter fires, q quits.";
+      Tab and Shift+Tab pick a weapon, Space or Enter fires, q quits.";
 
-fn parse_args() -> Result<Option<Config>, String> {
-    let mut cfg = Config {
-        players: 2,
-        rounds: 10,
-        generator: None,
-        bumpiness: land::BUMPINESS_DEF,
-        seed: rand::random(),
-    };
+struct Args {
+    cfg: Config,
+    weapons: Option<PathBuf>,
+}
+
+fn parse_args() -> Result<Option<Args>, String> {
+    let mut cfg = Config { seed: rand::random(), ..Config::default() };
+    let mut weapons = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -80,11 +90,39 @@ fn parse_args() -> Result<Option<Config>, String> {
             "--bumpiness" => {
                 cfg.bumpiness = value(&a)?.parse().map_err(|_| "--bumpiness takes a number")?;
             }
+            "--walls" => {
+                let v = value(&a)?;
+                cfg.walls = Walls::parse(&v).ok_or_else(|| format!("unknown walls '{v}'"))?;
+            }
+            "--wind" => {
+                cfg.max_wind = value(&a)?.parse().map_err(|_| "--wind takes a number")?;
+                if !(0.0..=physics::WIND_MAX).contains(&cfg.max_wind) {
+                    return Err(format!("--wind must be 0 to {}", physics::WIND_MAX));
+                }
+            }
+            "--steady-wind" => cfg.dynamic_wind = false,
+            "--viscosity" => {
+                cfg.viscosity = value(&a)?.parse().map_err(|_| "--viscosity takes a number")?;
+                if !(0.0..=physics::VISCOSITY_MAX).contains(&cfg.viscosity) {
+                    return Err(format!("--viscosity must be 0 to {}", physics::VISCOSITY_MAX));
+                }
+            }
+            "--weapons" => weapons = Some(PathBuf::from(value(&a)?)),
             "--seed" => cfg.seed = value(&a)?.parse().map_err(|_| "--seed takes a number")?,
             other => return Err(format!("unknown option '{other}'\n\n{USAGE}")),
         }
     }
-    Ok(Some(cfg))
+    Ok(Some(Args { cfg, weapons }))
+}
+
+fn load_arsenal(path: Option<&PathBuf>) -> Result<Arsenal, String> {
+    match path {
+        None => Arsenal::parse(weapons::DEFAULT_DEF),
+        Some(p) => {
+            let src = fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            Arsenal::parse(&src).map_err(|e| format!("{}: {e}", p.display()))
+        }
+    }
 }
 
 /// Session log in the state folder; the terminal is the game's.
@@ -106,19 +144,27 @@ fn init_logging() -> Option<PathBuf> {
 }
 
 fn main() -> ExitCode {
-    let cfg = match parse_args() {
-        Ok(Some(cfg)) => cfg,
+    let args = match parse_args() {
+        Ok(Some(args)) => args,
         Ok(None) => return ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("torched: {e}");
             return ExitCode::FAILURE;
         }
     };
+    let arsenal = match load_arsenal(args.weapons.as_ref()) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("torched: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cfg = args.cfg;
     let log_path = init_logging();
     info!("torched {} start, {:?}", env!("CARGO_PKG_VERSION"), cfg);
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, Game::new(cfg));
+    let result = run(&mut terminal, Game::new(cfg, arsenal));
     ratatui::restore();
     info!("exit");
 
@@ -169,6 +215,8 @@ fn key(game: &mut Game, k: KeyEvent) -> bool {
         KeyCode::Down => game.adjust_power(-power),
         KeyCode::PageUp => game.adjust_power(sim::POWER_BIGSTEP),
         KeyCode::PageDown => game.adjust_power(-sim::POWER_BIGSTEP),
+        KeyCode::Tab | KeyCode::Char(']') => game.cycle_weapon(1),
+        KeyCode::BackTab | KeyCode::Char('[') => game.cycle_weapon(-1),
         KeyCode::Char(' ') | KeyCode::Enter => match game.phase {
             Phase::Aim => game.fire(),
             Phase::RoundOver | Phase::GameOver => game.advance(),

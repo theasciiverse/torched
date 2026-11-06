@@ -14,7 +14,7 @@ for where each lives in its source).
 
 ## 0.2.0: the arsenal
 
-- All 44 weapons from `weapons.def`: explosives, MIRVs and split weapons, napalm that runs
+- All 36 weapons from `weapons.def`: explosives, MIRVs and split weapons, napalm that runs
   downhill, rollers, riot charges, diggers and sandhogs, dirt weapons, tracers
 - Wind, air viscosity and the six wall kinds
 - Weapons read from data files in the spirit of `weapons.def`, not hard-coded

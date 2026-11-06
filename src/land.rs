@@ -225,12 +225,14 @@ impl Profile {
 #[derive(Clone)]
 pub struct Land {
     cells: Vec<bool>,
+    /// Wrap walls: x wraps around (`sc_land_translate_x`).
+    pub wrap: bool,
 }
 
 impl Land {
     pub fn generate(generator: Generator, bumpiness: f64, rng: &mut impl Rng) -> Land {
         let profile = Profile::new(generator, bumpiness, rng);
-        let mut land = Land { cells: vec![false; WIDTH * HEIGHT] };
+        let mut land = Land::empty();
         for x in 0..WIDTH {
             // Xscorch fills columns from the right, evaluating at x/width.
             let h = (profile.eval((WIDTH - x) as f64 / WIDTH as f64) * MAX_HEIGHT) as usize;
@@ -242,43 +244,108 @@ impl Land {
     }
 
     pub fn empty() -> Land {
-        Land { cells: vec![false; WIDTH * HEIGHT] }
+        Land { cells: vec![false; WIDTH * HEIGHT], wrap: false }
+    }
+
+    /// A column inside the field, wrapping if the walls wrap.
+    #[inline]
+    pub fn column(&self, x: i32) -> Option<usize> {
+        if self.wrap {
+            Some(x.rem_euclid(WIDTH as i32) as usize)
+        } else if x < 0 || x >= WIDTH as i32 {
+            None
+        } else {
+            Some(x as usize)
+        }
+    }
+
+    /// Horizontal distance from a to b, the short way round if wrapping.
+    pub fn dx(&self, a: f64, b: f64) -> f64 {
+        let d = b - a;
+        if self.wrap {
+            let w = WIDTH as f64;
+            d - w * (d / w).round()
+        } else {
+            d
+        }
     }
 
     #[inline]
     pub fn get(&self, x: i32, y: i32) -> bool {
-        if x < 0 || y < 0 || x >= WIDTH as i32 || y >= HEIGHT as i32 {
-            return false;
+        match self.column(x) {
+            Some(cx) if y >= 0 && y < HEIGHT as i32 => self.cells[cx * HEIGHT + y as usize],
+            _ => false,
         }
-        self.cells[x as usize * HEIGHT + y as usize]
     }
 
     pub fn set(&mut self, x: i32, y: i32, v: bool) {
-        if x >= 0 && y >= 0 && x < WIDTH as i32 && y < HEIGHT as i32 {
-            self.cells[x as usize * HEIGHT + y as usize] = v;
+        if let Some(cx) = self.column(x)
+            && y >= 0
+            && y < HEIGHT as i32
+        {
+            self.cells[cx * HEIGHT + y as usize] = v;
         }
     }
 
     /// Height of the topmost ground in column x (0 if none).
     pub fn top(&self, x: i32) -> i32 {
-        if x < 0 || x >= WIDTH as i32 {
-            return 0;
-        }
-        let col = &self.cells[x as usize * HEIGHT..(x as usize + 1) * HEIGHT];
+        let Some(x) = self.column(x) else { return 0 };
+        let col = &self.cells[x * HEIGHT..(x + 1) * HEIGHT];
         col.iter().rposition(|&c| c).map_or(0, |y| y as i32 + 1)
     }
 
     /// Clear a disc, the crater of a normal explosion.
     pub fn carve(&mut self, cx: f64, cy: f64, r: f64) {
+        self.disc(cx, cy, r, None, false);
+    }
+
+    /// Fill the sky in a disc with dirt (`SC_EXPLOSION_DIRT`).
+    pub fn fill(&mut self, cx: f64, cy: f64, r: f64) {
+        self.disc(cx, cy, r, None, true);
+    }
+
+    /// Clear or fill a disc, or only the wedge of it within `width/2`
+    /// radians either side of `dir` (riot charges).
+    pub fn disc(&mut self, cx: f64, cy: f64, r: f64, wedge: Option<(f64, f64)>, fill: bool) {
         let (x0, x1) = ((cx - r).floor() as i32, (cx + r).ceil() as i32);
         let (y0, y1) = ((cy - r).floor() as i32, (cy + r).ceil() as i32);
         for x in x0..=x1 {
             for y in y0..=y1 {
                 let (dx, dy) = (x as f64 - cx, y as f64 - cy);
-                if dx * dx + dy * dy <= r * r {
-                    self.set(x, y, false);
+                if dx * dx + dy * dy > r * r {
+                    continue;
                 }
+                if let Some((dir, width)) = wedge {
+                    let off = (dy.atan2(dx) - dir + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI;
+                    if off.abs() > width / 2.0 && dx * dx + dy * dy > 4.0 {
+                        continue;
+                    }
+                }
+                self.set(x, y, fill);
             }
+        }
+    }
+
+    /// A liquid's flood from an impact, as `sc_spill_new`: clear the
+    /// impact cell, then fill sky cells depth first, down before sideways,
+    /// sideways before up, until `size` cells are wet or nowhere is left.
+    /// Returns the cells in the order they fill.
+    pub fn spill(&mut self, cx: i32, cy: i32, size: usize, rng: &mut impl Rng) -> Vec<(i32, i32)> {
+        let mut sp = Spill { cells: Vec::new(), seen: std::collections::HashSet::new(), size };
+        let Some(cx) = self.column(cx) else { return sp.cells };
+        if cy < 0 || cy >= HEIGHT as i32 {
+            return sp.cells;
+        }
+        let cx = cx as i32;
+        self.set(cx, cy, false);
+        sp.fill(self, cx, cy - 1, true, rng);
+        sp.cells
+    }
+
+    /// Turn cells into dirt (liquid dirt setting).
+    pub fn add_dirt(&mut self, cells: &[(i32, i32)]) {
+        for &(x, y) in cells {
+            self.set(x, y, true);
         }
     }
 
@@ -309,6 +376,42 @@ impl Land {
             moving = true;
         }
         moving
+    }
+}
+
+struct Spill {
+    cells: Vec<(i32, i32)>,
+    seen: std::collections::HashSet<(i32, i32)>,
+    size: usize,
+}
+
+impl Spill {
+    fn fill(&mut self, land: &Land, x: i32, y: i32, allow_up: bool, rng: &mut impl Rng) {
+        let r = if rng.random::<bool>() { 1 } else { -1 };
+        self.try_fill(land, x, y - 1, false, rng);
+        self.try_fill(land, x + r, y - 1, false, rng);
+        self.try_fill(land, x - r, y - 1, false, rng);
+        self.try_fill(land, x + r, y, false, rng);
+        self.try_fill(land, x - r, y, false, rng);
+        // Only the centre column may climb, when trapped in a hollow.
+        if allow_up {
+            self.try_fill(land, x, y + 1, true, rng);
+            self.try_fill(land, x + r, y + 1, true, rng);
+            self.try_fill(land, x - r, y + 1, true, rng);
+        }
+    }
+
+    fn try_fill(&mut self, land: &Land, x: i32, y: i32, allow_up: bool, rng: &mut impl Rng) {
+        if self.cells.len() >= self.size || y < 0 || y >= HEIGHT as i32 {
+            return;
+        }
+        let Some(x) = land.column(x) else { return };
+        let x = x as i32;
+        if land.get(x, y) || !self.seen.insert((x, y)) {
+            return;
+        }
+        self.cells.push((x, y));
+        self.fill(land, x, y, allow_up, rng);
     }
 }
 
@@ -347,6 +450,29 @@ mod tests {
         // 41 cells cleared under the column, so it settles 41 lower.
         assert_eq!(land.top(100), 159);
         assert!((0..159).all(|y| land.get(100, y)));
+    }
+
+    #[test]
+    fn a_spill_pools_in_a_hollow() {
+        let mut land = Land::empty();
+        land.level(400, 400, 100);
+        land.carve(400.0, 100.0, 20.0);
+        let mut rng = StdRng::seed_from_u64(1);
+        let cells = land.spill(400, 99, 200, &mut rng);
+        assert_eq!(cells.len(), 200);
+        // It runs to the bottom of the crater first and stays in it.
+        assert!(cells.iter().all(|&(x, y)| (x - 400).abs() <= 21 && y <= 100 + 3));
+        assert!(cells.iter().any(|&(_, y)| y <= 81));
+    }
+
+    #[test]
+    fn wrap_joins_the_edges() {
+        let mut land = Land::empty();
+        land.wrap = true;
+        land.carve(0.0, 0.0, 0.0);
+        land.set(-1, 5, true);
+        assert!(land.get(WIDTH as i32 - 1, 5));
+        assert_eq!(land.dx(790.0, 10.0), 20.0);
     }
 
     #[test]

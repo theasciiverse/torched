@@ -4,13 +4,16 @@ Artillery on destructible ground, a total conversion of Xscorch (Justin David Sm
 Jacob Luna Lundberg, 2000 to 2009; GPL-2.0-only), itself a free remake of Scorched Earth
 (Wendell Hicken, 1991). Rust + Ratatui, the playfield in Braille.
 
-**Status** (2026-11-06): 0.1.0 written, waiting to be played: terrain, hot-seat aiming,
-Baby Missile, craters, falling dirt and tanks, rounds. Built from scratch in Rust (David,
-2026-11-06), not as a fork of Gorched. Build order in `ROADMAP.md`.
+**Status** (2026-11-06): 0.1.0 and 0.2.0 written, neither played yet: terrain, hot-seat
+aiming, the whole arsenal, wind, air, walls, rounds. Until the shop (0.3.0) every weapon
+is free and unlimited, picked with Tab. Built from scratch in Rust (David, 2026-11-06),
+not as a fork of Gorched. Build order in `ROADMAP.md`.
 
-Code: `src/land.rs` (terrain generators, falling dirt), `src/sim.rs` (the game, no
-terminal), `src/render.rs` (Braille field, HUD), `src/main.rs`. Session log at
-`~/.local/state/torched/session.log`, level from `TORCHED_LOG`.
+Code: `src/land.rs` (terrain generators, falling dirt, liquid spills), `src/physics.rs`
+(flight, wind, drag, walls), `src/weapons.rs` (reads `data/weapons.def`), `src/sim.rs`
+(the game, no terminal), `src/render.rs` (Braille field, HUD), `src/main.rs`. Session log
+at `~/.local/state/torched/session.log`, level from `TORCHED_LOG`.
+`cargo test --release timing -- --ignored --nocapture` times every weapon's turn.
 
 Found in the source while building 0.1.0:
 
@@ -19,6 +22,17 @@ Found in the source while building 0.1.0:
 - Xscorch has no fall damage ("Currently, parachutes do NOTHING", `accessories.def`). The
   fall damage here (2 per unit past 3) is ours, for `ROADMAP.md`; see `sim.rs`.
 - Power is capped by life, so a badly hurt tank can't reach far (`sc_player_advance_power`).
+- Xscorch's `weapons.def` has 39 entries, not 44: 36 weapons, plus No Weapon, the BMM
+  Child (only made by a Black Market MIRV) and a Roller Tester.
+- Unfinished in Xscorch, so Torched's own: diggers and sandhogs (hidden there, "partially
+  written"; sandhogs had no behaviour at all), air viscosity ("N/A" in its dialog). Ours:
+  diggers and sandhogs burrow `digLength` units clearing a `tunnelRadius` tunnel, turning
+  15% of the time, and sandhogs then detonate; drag is linear, `dv/dt = a - k v`.
+- Also ours: rollers head downhill on landing and move at a watchable pace (Xscorch moves
+  them sixteen times per step). They gain 0.5 speed per unit fallen, as in Xscorch, so
+  they get fast.
+- Defaults as in Xscorch: wrap walls, wind up to 0.05 changing every turn. With wrap
+  walls, blasts, spills and damage wrap around the edges too.
 
 ## Name
 
@@ -50,7 +64,7 @@ whole arsenal, wind, walls, computer players and smooth Braille ground.
 
 What the original has, checked in its source:
 
-- 44 weapons: missiles and nukes, Leap Frog, Funky Bomb, MIRV and Black Market MIRV, Death's
+- 36 weapons: missiles and nukes, Leap Frog, Funky Bomb, MIRV and Black Market MIRV, Death's
   Head, Annihilator, The Chaos and The Chaos^2, four napalms, tracers, Shield Sapper, rollers,
   four riot charges, diggers and sandhogs, four dirt weapons
 - 17 accessories: magnetic, standard and force shields in three sizes, fuel, Triple Turret,

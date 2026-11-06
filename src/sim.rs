@@ -1,18 +1,17 @@
-//! The game itself, with no terminal in it: tanks, the shot in flight,
+//! The game itself, with no terminal in it: tanks, shells in flight,
 //! blasts, falling dirt and tanks, turns and rounds. Rules and numbers are
-//! Xscorch's (`sphysics.c`, `splayer.c`, `sexplosion.c`) unless marked.
+//! Xscorch's (`sphysics.c`, `strack.c`, `sphoenix.c`, `splayer.c`,
+//! `sexplosion.c`) unless marked as Torched's own.
 
-use std::collections::VecDeque;
+use std::rc::Rc;
 
 use log::info;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
 use crate::land::{self, Generator, Land};
+use crate::physics::{self, BORDERS_EXTEND, GRAVITY, Path, TIMEOUT, VELOCITY_SCALE, Walls};
+use crate::weapons::{Arsenal, Weapon};
 
-/// Gravity in units per step per step (`SC_PHYSICS_GRAVITY_DEF`).
-pub const GRAVITY: f64 = 0.5;
-/// Units per step per point of power (`SC_PHYSICS_VELOCITY_SCL`).
-pub const VELOCITY_SCALE: f64 = 0.027;
 pub const MAX_POWER: i32 = 1000;
 pub const MAX_LIFE: i32 = 1000;
 pub const POWER_STEP: i32 = 1;
@@ -31,29 +30,51 @@ pub const TANK_HEIGHT: i32 = 7;
 /// (50 ms cycle) is slow on a terminal; 30 a second crosses the field at
 /// full power in about three seconds.
 pub const STEPS_PER_TICK: f64 = 0.5;
-/// Ticks a blast takes to reach full size, and again to fade.
-const BLAST_TICKS: u32 = 9;
 /// Dirt and tanks fall this far per tick while settling. Xscorch allows
 /// up to 48 and 32 per cycle; smaller here so the fall is seen.
 const DIRT_DROP_PER_TICK: usize = 6;
 const TANK_DROP_PER_TICK: i32 = 4;
-/// Steps before a shot that never lands fizzles out.
-const SHOT_TIMEOUT: f64 = 4000.0;
 
 /// Fall damage. Not Xscorch, which has none ("Currently, parachutes do
-/// NOTHING", `accessories.def`); the Scorched Earth rule `ROADMAP.md` asks
-/// for. Falls up to the climb height are free.
+/// NOTHING", `accessories.def`; its Tanks Fall setting is "N/A"); the
+/// Scorched Earth rule `ROADMAP.md` asks for. Falls up to the climb
+/// height are free.
 pub const FALL_FREE: i32 = 3;
 pub const FALL_DAMAGE_PER_UNIT: i32 = 2;
-
-/// The Baby Missile (`weapons.def`).
-pub const BABY_RADIUS: f64 = 20.0;
-pub const BABY_FORCE: f64 = 400.0;
 
 /// Death explosions (`sweapon.h`, `sc_player_death`).
 const SMALL_EXPLOSION: (f64, f64) = (40.0, 100.0);
 const MEDIUM_EXPLOSION: (f64, f64) = (120.0, 300.0);
 const LARGE_EXPLOSION: (f64, f64) = (200.0, 700.0);
+const DEATH_NAPALM: (f64, f64, usize) = (13.0, 30.0, 400);
+
+/// Phoenix numbers (`sphoenix.h`).
+const PROB_AT_RAND: f64 = 0.01;
+const INCREASE_FACTOR: f64 = 0.85;
+const MIN_FROG_POWER: f64 = 70.0;
+const MAX_FROG_POWER: f64 = 350.0;
+const SPIDER_ARC: f64 = 128.0;
+const SPIDER_POWER: f64 = 0.25;
+const SPIDER_MAX_LEG_ATTEMPTS: usize = 100;
+
+/// Rollers (`sphysics.h`): speed gained per unit fallen, lost per unit
+/// climbed.
+const ROLLER_FALL: f64 = 0.5;
+const ROLLER_GAIN: f64 = 1.3;
+/// Torched's own: rollers move this many units per step for each unit of
+/// speed (Xscorch moves them sixteen times per step, too fast to watch),
+/// never slower than ROLLER_MIN_SPEED.
+const ROLLER_PACE: f64 = 2.0;
+const ROLLER_MIN_SPEED: f64 = 1.0;
+/// Torched's own: diggers burrow this fast, units per tick, and change
+/// direction this often per unit (Xscorch's `SC_TRAJ_DIGGER_PROB`).
+const DIG_PER_TICK: usize = 3;
+const DIGGER_TURN_PROB: f64 = 0.15;
+
+/// Liquids spread this many cells per tick (`SC_EXPL_LIQUID_STEP`), and
+/// napalm burns on this long once spread.
+const LIQUID_STEP: usize = 32;
+const NAPALM_BURN_TICKS: u32 = 90;
 
 pub const TANK_COLOURS: usize = 4;
 
@@ -71,6 +92,8 @@ pub struct Tank {
     pub alive: bool,
     pub wins: u32,
     pub kills: u32,
+    /// Selected weapon, an index into the arsenal.
+    pub weapon: usize,
     /// Where the last shot of this tank flew, kept for aiming.
     pub last_trail: Vec<(f64, f64)>,
     killed_by: Option<usize>,
@@ -89,65 +112,162 @@ impl Tank {
         (px + (TURRET_RADIUS + 1.0) * a.cos(), py + (TURRET_RADIUS + 1.0) * a.sin())
     }
 
-    fn contains(&self, x: f64, y: f64) -> bool {
+    fn contains(&self, land: &Land, x: f64, y: f64) -> bool {
         self.alive
-            && (x - self.x as f64).abs() <= TANK_RADIUS as f64
+            && land.dx(self.x as f64, x).abs() <= TANK_RADIUS as f64
             && y >= self.y as f64
             && y <= (self.y + TANK_HEIGHT) as f64
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Shot {
-    pub owner: usize,
-    ctr: (f64, f64),
-    vel: (f64, f64),
-    t: f64,
-    pub x: f64,
-    pub y: f64,
-    pub trail: Vec<(f64, f64)>,
+#[derive(Clone, Copy, Debug)]
+enum Motion {
+    Flight { path: Path, t: f64 },
+    Roll { vx: f64 },
+    Dig { dir: (i32, i32), left: f64 },
 }
 
-impl Shot {
-    /// Position at step t: `ctr + v t - 0.5 g t^2` (`sc_traj_get_current_*`).
-    fn at(&self, t: f64) -> (f64, f64) {
-        (
-            self.ctr.0 + t * self.vel.0,
-            self.ctr.1 + t * (self.vel.1 - 0.5 * t * GRAVITY),
-        )
+/// A warhead on its way: flying, rolling or burrowing.
+#[derive(Clone, Debug)]
+pub struct Shell {
+    pub weapon: usize,
+    pub owner: usize,
+    motion: Motion,
+    pub x: f64,
+    pub y: f64,
+    /// Last place it was that wasn't an impact.
+    clear: (f64, f64),
+    pub trail: Vec<(f64, f64)>,
+    /// Yield, shrinking with each Leap Frog bounce (`exp_res`).
+    exp_res: f64,
+    /// Bounces so far, for chain weapons.
+    chain: u32,
+    /// Steps alive, for the timeout.
+    age: f64,
+    /// Ticks to wait before moving, so a bounce waits for its crater.
+    pub delay: u32,
+    /// The shell the tank fired; its trail is kept for aiming.
+    root: bool,
+}
+
+impl Shell {
+    pub fn rolling(&self) -> bool {
+        matches!(self.motion, Motion::Roll { .. })
     }
+
+    pub fn digging(&self) -> bool {
+        matches!(self.motion, Motion::Dig { .. })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlastKind {
+    Normal,
+    Plasma,
+    Riot,
+    Dirt,
+    Napalm,
+    LiquidDirt,
 }
 
 #[derive(Clone, Debug)]
 pub struct Blast {
+    pub kind: BlastKind,
     pub x: f64,
     pub y: f64,
     pub radius: f64,
     force: f64,
     owner: usize,
     pub age: u32,
+    /// Ticks before it starts.
+    pub delay: u32,
+    /// Ticks to full size, and again to fade.
+    pub grow: u32,
+    /// (direction, width) in radians for wedge blasts.
+    pub wedge: Option<(f64, f64)>,
+    /// Cells of a liquid, in the order they fill.
+    pub spill: Vec<(i32, i32)>,
+    /// A spider leg's arc from the bomb to where it lands.
+    pub arc: Vec<(f64, f64)>,
 }
 
 impl Blast {
+    fn new(kind: BlastKind, x: f64, y: f64, radius: f64, force: f64, owner: usize) -> Blast {
+        Blast {
+            kind,
+            x,
+            y,
+            radius,
+            force,
+            owner,
+            age: 0,
+            delay: 0,
+            grow: (6.0 + radius / 10.0).min(30.0) as u32,
+            wedge: None,
+            spill: Vec::new(),
+            arc: Vec::new(),
+        }
+    }
+
+    fn liquid(&self) -> bool {
+        matches!(self.kind, BlastKind::Napalm | BlastKind::LiquidDirt)
+    }
+
+    /// Ticks until a liquid has finished spreading.
+    fn spread_ticks(&self) -> u32 {
+        self.spill.len().div_ceil(LIQUID_STEP) as u32
+    }
+
+    /// The tick its effect lands.
+    fn peak(&self) -> u32 {
+        if self.liquid() { self.spread_ticks().max(1) } else { self.grow }
+    }
+
+    fn lifetime(&self) -> u32 {
+        match self.kind {
+            BlastKind::Napalm => self.peak() + NAPALM_BURN_TICKS,
+            BlastKind::LiquidDirt => self.peak(),
+            _ => 2 * self.grow,
+        }
+    }
+
+    pub fn active(&self) -> bool {
+        self.delay == 0
+    }
+
     /// Radius to draw now, growing then fading.
     pub fn shown_radius(&self) -> f64 {
-        let a = self.age.min(2 * BLAST_TICKS) as f64;
-        let k = BLAST_TICKS as f64;
+        let a = self.age.min(2 * self.grow) as f64;
+        let k = self.grow as f64;
         let f = if a <= k { a / k } else { (2.0 * k - a) / k };
         self.radius * f.max(0.15)
     }
 
     /// 0 to 1, how far into the fade.
     pub fn fade(&self) -> f64 {
-        (self.age.saturating_sub(BLAST_TICKS) as f64 / BLAST_TICKS as f64).min(1.0)
+        let end = self.lifetime().saturating_sub(self.peak()).max(1);
+        (self.age.saturating_sub(self.peak()) as f64 / end as f64).min(1.0)
     }
+
+    /// Liquid cells showing now.
+    pub fn wet(&self) -> &[(i32, i32)] {
+        let n = (self.age as usize * LIQUID_STEP).min(self.spill.len());
+        &self.spill[..n]
+    }
+}
+
+/// Smoke left by a smoke tracer, for the round.
+#[derive(Clone, Debug)]
+pub struct Smoke {
+    pub owner: usize,
+    pub points: Vec<(f64, f64)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Aim,
-    Flight,
-    Blast,
+    /// Shells and blasts under way.
+    Action,
     Settle,
     RoundOver,
     GameOver,
@@ -161,27 +281,60 @@ pub struct Config {
     pub generator: Option<Generator>,
     pub bumpiness: f64,
     pub seed: u64,
+    pub walls: Walls,
+    pub max_wind: f64,
+    pub dynamic_wind: bool,
+    pub viscosity: f64,
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            players: 2,
+            rounds: 10,
+            generator: None,
+            bumpiness: land::BUMPINESS_DEF,
+            seed: 0,
+            walls: Walls::Wrap,
+            max_wind: physics::WIND_DEF,
+            dynamic_wind: true,
+            viscosity: 0.0,
+        }
+    }
+}
+
+enum Hit {
+    Tank,
+    Land,
+    Wall,
+    Ground,
 }
 
 pub struct Game {
     pub cfg: Config,
+    pub arsenal: Rc<Arsenal>,
     pub land: Land,
     pub generator: Generator,
+    /// This round's walls (Random resolved).
+    pub walls: Walls,
+    pub wind: f64,
     pub tanks: Vec<Tank>,
     pub turn: usize,
     pub phase: Phase,
     pub round: u32,
-    pub shot: Option<Shot>,
-    pub blast: Option<Blast>,
-    pending: VecDeque<Blast>,
+    pub shells: Vec<Shell>,
+    pub blasts: Vec<Blast>,
+    pub smoke: Vec<Smoke>,
     pub message: String,
     pub round_winner: Option<usize>,
     rng: StdRng,
 }
 
 impl Game {
-    pub fn new(cfg: Config) -> Game {
+    pub fn new(cfg: Config, arsenal: Arsenal) -> Game {
         let mut rng = StdRng::seed_from_u64(cfg.seed);
+        let arsenal = Rc::new(arsenal);
+        let start = arsenal.default_weapon();
         let tanks = (0..cfg.players)
             .map(|i| Tank {
                 name: format!("Player {}", i + 1),
@@ -194,6 +347,7 @@ impl Game {
                 alive: true,
                 wins: 0,
                 kills: 0,
+                weapon: start,
                 last_trail: Vec::new(),
                 killed_by: None,
                 fall_from: None,
@@ -203,16 +357,19 @@ impl Game {
         let mut g = Game {
             land: Land::empty(),
             generator,
+            walls: cfg.walls,
+            wind: 0.0,
             tanks,
             turn: 0,
             phase: Phase::Aim,
             round: 0,
-            shot: None,
-            blast: None,
-            pending: VecDeque::new(),
+            shells: Vec::new(),
+            blasts: Vec::new(),
+            smoke: Vec::new(),
             message: String::new(),
             round_winner: None,
             rng,
+            arsenal,
             cfg,
         };
         g.start_round();
@@ -223,13 +380,20 @@ impl Game {
         &self.tanks[self.turn]
     }
 
+    pub fn weapon(&self, i: usize) -> &Weapon {
+        &self.arsenal.weapons[i]
+    }
+
     fn start_round(&mut self) {
         self.round += 1;
         self.generator = self.cfg.generator.unwrap_or_else(|| Generator::random(&mut self.rng));
+        self.walls = self.cfg.walls.resolve(&mut self.rng);
+        self.wind = physics::initial_wind(self.cfg.max_wind, &mut self.rng);
         self.land = Land::generate(self.generator, self.cfg.bumpiness, &mut self.rng);
-        self.shot = None;
-        self.blast = None;
-        self.pending.clear();
+        self.land.wrap = self.walls == Walls::Wrap;
+        self.shells.clear();
+        self.blasts.clear();
+        self.smoke.clear();
         self.round_winner = None;
 
         // Spread the tanks out, a slot each in random order, and level a
@@ -258,8 +422,14 @@ impl Game {
         }
         self.turn = self.rng.random_range(0..n);
         self.phase = Phase::Aim;
-        self.message = format!("Round {} of {}: {}", self.round, self.cfg.rounds, self.generator.name());
-        info!("round {} start, terrain {:?}, first {}", self.round, self.generator, self.turn);
+        self.message = format!(
+            "Round {} of {}: {}, {} walls",
+            self.round,
+            self.cfg.rounds,
+            self.generator.name(),
+            self.walls.name()
+        );
+        info!("round {} start, terrain {:?}, walls {:?}, wind {:.3}", self.round, self.generator, self.walls, self.wind);
     }
 
     /// Start the next round, or a fresh game after the last.
@@ -293,132 +463,592 @@ impl Game {
         }
     }
 
+    /// Step through the weapons a player can pick.
+    pub fn cycle_weapon(&mut self, delta: i32) {
+        if self.phase != Phase::Aim {
+            return;
+        }
+        let list = self.arsenal.selectable();
+        let t = &mut self.tanks[self.turn];
+        let at = list.iter().position(|&w| w == t.weapon).unwrap_or(0) as i32;
+        t.weapon = list[(at + delta).rem_euclid(list.len() as i32) as usize];
+    }
+
     pub fn fire(&mut self) {
         if self.phase != Phase::Aim {
             return;
         }
         let t = &self.tanks[self.turn];
+        let wi = t.weapon;
+        let ars = self.arsenal.clone();
+        let w = &ars.weapons[wi];
         let (x, y) = t.muzzle();
         let a = (t.angle as f64).to_radians();
         let v = t.power as f64 * VELOCITY_SCALE;
-        info!("{} fires: angle {} power {}", t.name, t.angle, t.power);
-        self.shot = Some(Shot {
-            owner: self.turn,
-            ctr: (x, y),
-            vel: (v * a.cos(), v * a.sin()),
-            t: 0.0,
-            x,
-            y,
-            trail: vec![(x, y)],
-        });
+        info!("{} fires {}: angle {} power {}", t.name, w.name, t.angle, t.power);
         self.message.clear();
-        self.phase = Phase::Flight;
+        self.phase = Phase::Action;
+        // Weapons that act as they leave the barrel: riot charges blow a
+        // wedge in the turret's direction (`_sc_phoenix_detonate`).
+        if w.phoenix.at_tank && w.phoenix.detonate {
+            let owner = self.turn;
+            self.explode(wi, x, y, 1.0, owner, Some(a));
+            return;
+        }
+        let shell = self.new_shell(wi, self.turn, (x, y), (v * a.cos(), v * a.sin()));
+        self.shells.push(Shell { root: true, ..shell });
+    }
+
+    fn new_shell(&self, weapon: usize, owner: usize, at: (f64, f64), vel: (f64, f64)) -> Shell {
+        let path = Path { ctr: at, vel, acc: (self.wind, -GRAVITY), drag: self.cfg.viscosity };
+        Shell {
+            weapon,
+            owner,
+            motion: Motion::Flight { path, t: 0.0 },
+            x: at.0,
+            y: at.1,
+            clear: at,
+            trail: vec![at],
+            exp_res: 1.0,
+            chain: 0,
+            age: 0.0,
+            delay: 0,
+            root: false,
+        }
     }
 
     pub fn tick(&mut self) {
         match self.phase {
-            Phase::Flight => self.tick_flight(),
-            Phase::Blast => self.tick_blast(),
+            Phase::Action => {
+                self.tick_blasts();
+                self.tick_shells();
+                if self.shells.is_empty() && self.blasts.is_empty() {
+                    self.phase = Phase::Settle;
+                }
+            }
             Phase::Settle => self.tick_settle(),
             Phase::Aim | Phase::RoundOver | Phase::GameOver => {}
         }
     }
 
-    fn tick_flight(&mut self) {
-        let Some(shot) = self.shot.as_mut() else {
-            self.phase = Phase::Settle;
-            return;
-        };
-        let t1 = shot.t + STEPS_PER_TICK;
-        let (x0, y0) = (shot.x, shot.y);
-        let (x1, y1) = shot.at(t1);
-        shot.t = t1;
-        // Walk the segment no more than one unit at a time, as
+    // ---- Shells -------------------------------------------------------
+
+    fn tick_shells(&mut self) {
+        let shells = std::mem::take(&mut self.shells);
+        for mut s in shells {
+            if s.delay > 0 {
+                s.delay -= 1;
+                self.shells.push(s);
+                continue;
+            }
+            let alive = match s.motion {
+                Motion::Flight { .. } => self.fly(&mut s),
+                Motion::Roll { .. } => self.roll(&mut s),
+                Motion::Dig { .. } => self.dig(&mut s),
+            };
+            if s.trail.last() != Some(&(s.x, s.y)) {
+                s.trail.push((s.x, s.y));
+            }
+            if alive {
+                self.shells.push(s);
+            } else {
+                self.retire(s);
+            }
+        }
+    }
+
+    /// A shell is done: keep the fired shell's path, and a smoke tracer's.
+    fn retire(&mut self, s: Shell) {
+        if self.arsenal.weapons[s.weapon].state.smoke {
+            self.smoke.push(Smoke { owner: s.owner, points: s.trail.clone() });
+        }
+        if s.root {
+            self.tanks[s.owner].last_trail = s.trail;
+        }
+    }
+
+    /// Move a flying shell one tick. False when it's gone.
+    fn fly(&mut self, s: &mut Shell) -> bool {
+        let Motion::Flight { mut path, t } = s.motion else { unreachable!() };
+        let ars = self.arsenal.clone();
+        let w = &ars.weapons[s.weapon];
+        let going_up = t == 0.0 || path.at(t).1.1 >= 0.0;
+        let t1 = t + STEPS_PER_TICK;
+        let ((x1, y1), _) = path.at(t1);
+        // Walk the path no more than a unit at a time, as
         // `_sc_traj_traverse_path` does.
-        let n = (x1 - x0).abs().max((y1 - y0).abs()).ceil().max(1.0) as usize;
-        let mut impact = None;
-        let mut gone = false;
+        let n = (x1 - s.x).abs().max((y1 - s.y).abs()).ceil().clamp(1.0, 4000.0) as usize;
+        let mut offset = 0.0; // time a bounce restarted the path
+        let mut hit = None;
         for i in 1..=n {
-            let f = i as f64 / n as f64;
-            let (x, y) = (x0 + (x1 - x0) * f, y0 + (y1 - y0) * f);
-            // Walls: none. Off either side and the shot is lost; the sky
-            // is open above.
-            if x < 0.0 || x >= land::WIDTH as f64 {
-                gone = true;
-                break;
+            let ts = t + STEPS_PER_TICK * i as f64 / n as f64;
+            let ((mut x, mut y), (vx, vy)) = path.at(ts - offset);
+            let w_ = land::WIDTH as f64;
+            let h_ = land::HEIGHT as f64;
+            let off_side = x < 0.0 || x >= w_;
+            match self.walls {
+                Walls::Wrap if off_side => {
+                    let shift = if x < 0.0 { w_ } else { -w_ };
+                    path.ctr.0 += shift;
+                    x += shift;
+                }
+                Walls::None | Walls::Random if off_side => {
+                    if x < -BORDERS_EXTEND || x > w_ + BORDERS_EXTEND {
+                        s.x = x;
+                        s.y = y;
+                        return false;
+                    }
+                }
+                Walls::Concrete if off_side || y >= h_ => {
+                    hit = Some((Hit::Wall, x.clamp(0.0, w_ - 1.0), y.min(h_ - 1.0)));
+                    break;
+                }
+                walls => {
+                    if let Some(e) = walls.elasticity()
+                        && (off_side || y >= h_ || y < 0.0)
+                    {
+                        let (mut nvx, mut nvy) = (vx, vy);
+                        if off_side {
+                            x = x.clamp(0.0, w_ - 1.0);
+                            nvx = -vx * e;
+                        } else {
+                            y = y.clamp(0.0, h_ - 1.0);
+                            nvy = -vy * e;
+                        }
+                        path = Path { ctr: (x, y), vel: (nvx, nvy), ..path };
+                        offset = ts;
+                    }
+                }
             }
             if y < 0.0 {
-                impact = Some((x, 0.0));
+                hit = Some((Hit::Ground, x, 0.0));
                 break;
+            }
+            if !(0.0..w_).contains(&x) {
+                // Off the side with no walls: nothing to hit out there.
+                s.x = x;
+                s.y = y;
+                continue;
             }
             let (ix, iy) = (x.round() as i32, y.round() as i32);
-            if self.land.get(ix, iy) || self.tanks.iter().any(|t| t.contains(x, y)) {
-                impact = Some((x, y));
+            if self.tanks.iter().any(|tk| tk.contains(&self.land, x, y)) {
+                hit = Some((Hit::Tank, x, y));
                 break;
             }
-            shot.x = x;
-            shot.y = y;
+            if self.land.get(ix, iy) {
+                hit = Some((Hit::Land, x, y));
+                break;
+            }
+            s.clear = (s.x, s.y);
+            s.x = x;
+            s.y = y;
         }
-        if shot.trail.last() != Some(&(shot.x, shot.y)) {
-            shot.trail.push((shot.x, shot.y));
-        }
-        if shot.t > SHOT_TIMEOUT {
-            gone = true;
+        s.age += STEPS_PER_TICK;
+        let local = t1 - offset;
+        s.motion = Motion::Flight { path, t: local };
+
+        if let Some((kind, x, y)) = hit {
+            s.x = x;
+            s.y = y;
+            return self.impact(s, kind);
         }
 
-        if impact.is_none() && !gone {
+        // At the top of its arc (`_sc_weapon_track`).
+        if w.phoenix.at_apex && going_up && path.at(local).1.1 <= 0.0 {
+            return self.phoenix_split(s);
+        }
+        // Somewhere along the way, maybe (Black Market MIRVs).
+        if w.phoenix.at_rand && self.rng.random::<f64>() < 1.0 - (1.0 - PROB_AT_RAND).powf(STEPS_PER_TICK) {
+            return self.phoenix_split(s);
+        }
+        if s.age >= TIMEOUT {
+            return false;
+        }
+        true
+    }
+
+    /// A shell came down. False when it's gone.
+    fn impact(&mut self, s: &mut Shell, hit: Hit) -> bool {
+        let ars = self.arsenal.clone();
+        let w = &ars.weapons[s.weapon];
+        if w.phoenix.at_land && w.splits() {
+            if w.phoenix.convert && w.state.roller {
+                if matches!(hit, Hit::Tank) {
+                    // A roller that lands on a tank goes off there.
+                } else {
+                    self.start_roll(s);
+                    return true;
+                }
+            }
+            if w.phoenix.convert && w.state.digger && matches!(hit, Hit::Land) {
+                self.start_dig(s);
+                return true;
+            }
+            if w.phoenix.chain && s.chain < w.children {
+                self.leap(s);
+                return false;
+            }
+            if w.phoenix.spider {
+                self.spider(s);
+                return false;
+            }
+            if w.phoenix.scatter {
+                return self.phoenix_split(s);
+            }
+        }
+        let (x, y, owner, exp_res, wi) = (s.x, s.y, s.owner, s.exp_res, s.weapon);
+        self.explode(wi, x, y, exp_res, owner, None);
+        false
+    }
+
+    /// Break into children (`_sc_phoenix_scatter`): spread along the line
+    /// of flight, the outer ones fastest apart, the middle one keeping the
+    /// parent's speed. The parent just fizzles.
+    fn phoenix_split(&mut self, s: &mut Shell) -> bool {
+        let ars = self.arsenal.clone();
+        let w = &ars.weapons[s.weapon];
+        let (Some(child), n) = (w.child, w.children) else { return true };
+        if !w.phoenix.scatter || n == 0 {
+            return true;
+        }
+        let (mut vx, mut vy) = self.velocity(s);
+        let (mut xs, mut ys) = (0.0, 0.0);
+        if n > 1 {
+            let speed = vx.hypot(vy);
+            if speed == 0.0 {
+                xs = w.scatter;
+            } else {
+                xs = w.scatter * vx / speed;
+                ys = w.scatter * vy / speed;
+            }
+            vx -= 0.5 * xs;
+            vy -= 0.5 * ys;
+            xs /= n as f64;
+            ys /= n as f64;
+        }
+        for _ in 0..n {
+            vx += xs;
+            vy += ys;
+            let c = self.new_shell(child, s.owner, (s.x, s.y), (vx, vy));
+            self.shells.push(c);
+        }
+        false
+    }
+
+    fn velocity(&self, s: &Shell) -> (f64, f64) {
+        match s.motion {
+            Motion::Flight { path, t } => path.at(t).1,
+            Motion::Roll { vx } => (vx, 0.0),
+            Motion::Dig { .. } => (0.0, 0.0),
+        }
+    }
+
+    /// Leap Frog (`_sc_phoenix_chain`): the warhead goes off with its
+    /// child's blast, scaled down, and a smaller frog bounces on.
+    fn leap(&mut self, s: &mut Shell) {
+        let ars = self.arsenal.clone();
+        let w = &ars.weapons[s.weapon];
+        let child = &ars.weapons[w.child.expect("splits")];
+        let exp_res = s.exp_res * INCREASE_FACTOR;
+        let (vx, vy) = self.velocity(s);
+        let (lo, hi) = (VELOCITY_SCALE * MIN_FROG_POWER, VELOCITY_SCALE * MAX_FROG_POWER);
+        let dx = (vx.abs() * exp_res).clamp(lo, hi) * if vx < 0.0 { -1.0 } else { 1.0 };
+        let dy = (vy.abs() * exp_res).clamp(lo, hi);
+        let y = s.y.max(1.0);
+        let mut frog = self.new_shell(s.weapon, s.owner, (s.x, y), (dx, dy));
+        frog.exp_res = exp_res;
+        frog.chain = s.chain + 1;
+        let mut b = self.blast_for(w, s.x, y, exp_res, s.owner, None);
+        b.radius = exp_res * child.radius;
+        b.force = child.force;
+        b.grow = (6.0 + b.radius / 10.0).min(30.0) as u32;
+        // Wait for the crater before leaping out of it.
+        frog.delay = b.grow + 1;
+        self.add_blast(b);
+        self.shells.push(frog);
+    }
+
+    /// Funky Bomb (`_sc_phoenix_spider`): the bomb goes off, and legs
+    /// arc out to land on the ground around it, each its own blast.
+    fn spider(&mut self, s: &mut Shell) {
+        let ars = self.arsenal.clone();
+        let w = &ars.weapons[s.weapon];
+        let child = &ars.weapons[w.child.expect("splits")];
+        let count = w.children as usize;
+        let legs = count / 2 + if count / 2 > 0 { self.rng.random_range(0..count / 2) } else { 0 };
+        let scatter = (w.scatter * s.exp_res * w.radius * SPIDER_POWER).max(1.0);
+        let (x, y) = (s.x, s.y);
+        let main = self.blast_for(w, x, y, s.exp_res, s.owner, None);
+        let start_delay = main.grow;
+        self.add_blast(main);
+        let srcy = (self.land.top(x.round() as i32) as f64).max(y);
+        for i in 0..legs {
+            for _ in 0..SPIDER_MAX_LEG_ATTEMPTS {
+                let cx = x - scatter + self.rng.random_range(0.0..2.0 * scatter);
+                let cy = self.land.top(cx.round() as i32) as f64;
+                if cy <= y + SPIDER_ARC {
+                    let kind = if child.state.plasma { BlastKind::Plasma } else { BlastKind::Normal };
+                    let mut b = Blast::new(kind, cx, cy, s.exp_res * child.radius, child.force, s.owner);
+                    b.delay = start_delay + 3 * i as u32;
+                    b.arc = arc((x, srcy), (cx, cy), SPIDER_ARC);
+                    self.add_blast(b);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Roller lands (`sc_trajectory_convert`): it rolls from the last
+    /// clear point. Torched's choice: it heads downhill, whichever way it
+    /// was flying, as the weapons' descriptions say.
+    fn start_roll(&mut self, s: &mut Shell) {
+        let (vx, _) = self.velocity(s);
+        (s.x, s.y) = (s.clear.0.round(), s.clear.1.round().max(0.0));
+        let (x, y) = (s.x as i32, s.y as i32);
+        let below = |xx: i32| self.height_below(xx, y);
+        let (l, r) = (below(x - 3), below(x + 3));
+        let dir = if l < r {
+            -1.0
+        } else if r < l {
+            1.0
+        } else if vx < 0.0 {
+            -1.0
+        } else {
+            1.0
+        };
+        s.motion = Motion::Roll { vx: dir * vx.abs().max(ROLLER_MIN_SPEED) };
+        s.age = 0.0;
+    }
+
+    /// Top of the ground at or below height y in column x.
+    fn height_below(&self, x: i32, y: i32) -> i32 {
+        (0..=y.min(land::HEIGHT as i32 - 1)).rev().find(|&yy| self.land.get(x, yy)).map_or(0, |yy| yy + 1)
+    }
+
+    /// A rolling shell (`_sc_traj_traverse_roller`): along the ground,
+    /// falling where it can and gaining speed, climbing small steps at a
+    /// cost, going off when it can't go on.
+    fn roll(&mut self, s: &mut Shell) -> bool {
+        let Motion::Roll { mut vx } = s.motion else { unreachable!() };
+        let mut distance = vx.abs().max(ROLLER_MIN_SPEED) * ROLLER_PACE * STEPS_PER_TICK;
+        let mut done = false;
+        while distance > 0.0 && !done {
+            distance -= 1.0;
+            let dir = if vx < 0.0 { -1 } else { 1 };
+            let (x, y) = (s.x as i32, s.y as i32);
+            let mut nx = x + dir;
+            if nx < 0 || nx >= land::WIDTH as i32 {
+                match self.walls {
+                    Walls::Wrap => nx = nx.rem_euclid(land::WIDTH as i32),
+                    w if w.elasticity().is_some() => {
+                        vx = -vx * w.elasticity().unwrap_or(1.0);
+                        continue;
+                    }
+                    Walls::Concrete => {
+                        done = true;
+                        continue;
+                    }
+                    _ => {
+                        s.motion = Motion::Roll { vx };
+                        return false;
+                    }
+                }
+            }
+            let blocked = |g: &Game, xx: i32, yy: i32| g.land.get(xx, yy);
+            let tank_at = |g: &Game, xx: i32, yy: i32| g.tanks.iter().any(|t| t.contains(&g.land, xx as f64, yy as f64));
+            if tank_at(self, nx, y) {
+                s.x = nx as f64;
+                done = true;
+                continue;
+            }
+            if !blocked(self, nx, y) {
+                s.x = nx as f64;
+                if y > 0 && !blocked(self, nx, y - 1) {
+                    s.y -= 1.0;
+                    vx += ROLLER_FALL * dir as f64;
+                }
+                continue;
+            }
+            // Something in the way: climb a step if there's speed for it.
+            let climb = |g: &Game, up: i32| !blocked(g, nx, y + up) && !tank_at(g, nx, y + up);
+            if vx.abs() > ROLLER_GAIN && climb(self, 1) {
+                s.x = nx as f64;
+                s.y += 1.0;
+                vx -= ROLLER_GAIN * dir as f64;
+            } else if vx.abs() > 2.0 * ROLLER_GAIN && climb(self, 2) {
+                s.x = nx as f64;
+                s.y += 2.0;
+                vx -= 2.0 * ROLLER_GAIN * dir as f64;
+            } else {
+                done = true;
+            }
+        }
+        s.motion = Motion::Roll { vx };
+        s.age += STEPS_PER_TICK;
+        if done || s.age >= TIMEOUT {
+            let (x, y, owner, exp_res, wi) = (s.x, s.y, s.owner, s.exp_res, s.weapon);
+            self.explode(wi, x, y, exp_res, owner, None);
+            return false;
+        }
+        true
+    }
+
+    /// Digger lands. Xscorch's digger code was never finished ("probably
+    /// broken"); this is Torched's: it burrows on the way it was going,
+    /// down or sideways.
+    fn start_dig(&mut self, s: &mut Shell) {
+        let (vx, vy) = self.velocity(s);
+        let dir = if vx.abs() > vy.abs() * 1.5 { (if vx < 0.0 { -1 } else { 1 }, 0) } else { (0, -1) };
+        let w = &self.arsenal.weapons[s.weapon];
+        s.motion = Motion::Dig { dir, left: w.dig_length.max(1.0) };
+    }
+
+    /// A burrowing shell: clears a tunnel, turns now and then
+    /// (`SC_TRAJ_DIGGER_PROB`), stops when it runs out of dirt or length
+    /// or meets a tank. Sandhogs then detonate; diggers just stop.
+    fn dig(&mut self, s: &mut Shell) -> bool {
+        let Motion::Dig { mut dir, mut left } = s.motion else { unreachable!() };
+        let ars = self.arsenal.clone();
+        let w = &ars.weapons[s.weapon];
+        let r = w.tunnel_radius.max(1.0);
+        let mut done = false;
+        for _ in 0..DIG_PER_TICK {
+            let ahead = |g: &Game, d: (i32, i32)| {
+                let (ax, ay) = (s.x + d.0 as f64 * (r + 1.0), s.y + d.1 as f64 * (r + 1.0));
+                g.land.get(ax.round() as i32, ay.round() as i32)
+            };
+            let tank_ahead = |g: &Game, d: (i32, i32)| {
+                (1..=(r as i32 + 1)).any(|k| {
+                    let (ax, ay) = (s.x + (d.0 * k) as f64, s.y + (d.1 * k) as f64);
+                    g.tanks.iter().any(|t| t.contains(&g.land, ax, ay))
+                })
+            };
+            if tank_ahead(self, dir) {
+                done = true;
+                break;
+            }
+            let turns: [(i32, i32); 4] = [(0, -1), (-1, 0), (1, 0), (0, 1)];
+            if self.rng.random::<f64>() < DIGGER_TURN_PROB || !ahead(self, dir) {
+                let start = self.rng.random_range(0..4);
+                let next = (0..4).map(|k| turns[(start + k) % 4]).find(|&d| d != (-dir.0, -dir.1) && ahead(self, d));
+                match next {
+                    Some(d) => dir = d,
+                    None if ahead(self, dir) => {}
+                    None => {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            let (nx, ny) = (s.x + dir.0 as f64, s.y + dir.1 as f64);
+            if ny < 0.0 || (!self.land.wrap && !(0.0..land::WIDTH as f64).contains(&nx)) {
+                done = true;
+                break;
+            }
+            s.x = if self.land.wrap { nx.rem_euclid(land::WIDTH as f64) } else { nx };
+            s.y = ny;
+            self.land.carve(s.x, s.y, r);
+            left -= 1.0;
+            if left <= 0.0 {
+                done = true;
+                break;
+            }
+        }
+        s.motion = Motion::Dig { dir, left };
+        if done {
+            let (x, y, owner, exp_res, wi) = (s.x, s.y, s.owner, s.exp_res, s.weapon);
+            self.explode(wi, x, y, exp_res, owner, None);
+            return false;
+        }
+        true
+    }
+
+    // ---- Blasts -------------------------------------------------------
+
+    /// A weapon's warhead going off (`sc_weapon_get_explosion`).
+    fn explode(&mut self, weapon: usize, x: f64, y: f64, exp_res: f64, owner: usize, dir: Option<f64>) {
+        let ars = self.arsenal.clone();
+        let w = &ars.weapons[weapon];
+        if !w.explodes() {
             return;
         }
-        let shot = self.shot.take().expect("shot in flight");
-        let owner = shot.owner;
-        self.tanks[owner].last_trail = shot.trail;
-        match impact {
-            Some((x, y)) => {
-                self.pending.push_back(Blast { x, y, radius: BABY_RADIUS, force: BABY_FORCE, owner, age: 0 });
-                self.phase = Phase::Blast;
-            }
-            None => {
-                say(&mut self.message, "The shot sailed off the field.");
-                self.phase = Phase::Settle;
-            }
-        }
+        let b = self.blast_for(w, x, y, exp_res, owner, dir);
+        self.add_blast(b);
     }
 
-    fn tick_blast(&mut self) {
-        if self.blast.is_none() {
-            self.blast = self.pending.pop_front();
-            if self.blast.is_none() {
-                self.phase = Phase::Settle;
-                return;
-            }
+    fn blast_for(&mut self, w: &Weapon, x: f64, y: f64, exp_res: f64, owner: usize, dir: Option<f64>) -> Blast {
+        let kind = if w.state.plasma {
+            BlastKind::Plasma
+        } else if w.is_napalm() {
+            BlastKind::Napalm
+        } else if w.state.liquid {
+            BlastKind::LiquidDirt
+        } else if w.state.dirt {
+            BlastKind::Dirt
+        } else if w.state.riot {
+            BlastKind::Riot
+        } else {
+            BlastKind::Normal
+        };
+        let mut b = Blast::new(kind, x, y, exp_res * w.radius, w.force, owner);
+        if w.angular_width != 0.0 {
+            b.wedge = Some((dir.unwrap_or(std::f64::consts::FRAC_PI_2), w.angular_width.to_radians()));
         }
-        let b = self.blast.as_mut().expect("blast");
-        b.age += 1;
-        if b.age == BLAST_TICKS {
-            let b = b.clone();
-            self.detonate(&b);
+        if b.liquid() {
+            b.spill = self.land.spill(x.round() as i32, y.round() as i32, w.liquid, &mut self.rng);
         }
-        if self.blast.as_ref().is_some_and(|b| b.age >= 2 * BLAST_TICKS) {
-            self.blast = None;
-        }
+        b
     }
 
-    /// Crater and damage, at the blast's full size.
+    fn add_blast(&mut self, b: Blast) {
+        info!("blast {:?} at ({:.0}, {:.0}) r {:.0} f {:.0}", b.kind, b.x, b.y, b.radius, b.force);
+        self.blasts.push(b);
+    }
+
+    fn tick_blasts(&mut self) {
+        let mut blasts = std::mem::take(&mut self.blasts);
+        for b in &mut blasts {
+            if b.delay > 0 {
+                b.delay -= 1;
+                continue;
+            }
+            b.age += 1;
+            if b.kind == BlastKind::LiquidDirt {
+                let from = ((b.age - 1) as usize * LIQUID_STEP).min(b.spill.len());
+                let to = (b.age as usize * LIQUID_STEP).min(b.spill.len());
+                self.land.add_dirt(&b.spill[from..to]);
+            }
+            if b.age == b.peak() {
+                self.detonate(b);
+            }
+        }
+        blasts.retain(|b| b.delay > 0 || b.age < b.lifetime());
+        // Blasts added while these ran (deaths) go after them.
+        blasts.append(&mut self.blasts);
+        self.blasts = blasts;
+    }
+
+    /// A blast at full size: its mark on the ground, and damage.
     fn detonate(&mut self, b: &Blast) {
-        self.land.carve(b.x, b.y, b.radius);
+        match b.kind {
+            BlastKind::Normal | BlastKind::Plasma => self.land.carve(b.x, b.y, b.radius),
+            BlastKind::Riot => self.land.disc(b.x, b.y, b.radius, b.wedge, false),
+            BlastKind::Dirt => self.land.fill(b.x, b.y, b.radius),
+            BlastKind::Napalm | BlastKind::LiquidDirt => {}
+        }
         let mut hits = Vec::new();
-        for t in self.tanks.iter_mut() {
+        for i in 0..self.tanks.len() {
+            let t = &self.tanks[i];
             if !t.alive {
                 continue;
             }
-            // `sc_expl_damage_at_point`, measured to the tank's base point.
-            let (dx, dy) = (t.x as f64 - b.x, t.y as f64 - b.y);
-            let damage = (b.force * (1.0 - (dx * dx + dy * dy) / (b.radius * b.radius))).round() as i32;
+            let damage = self.damage_at(b, t.x as f64, t.y as f64);
             if damage > 0 {
+                let t = &mut self.tanks[i];
                 t.life -= damage;
                 t.killed_by = Some(b.owner);
                 hits.push(format!("{} -{}", t.name, damage));
-                info!("blast at ({:.0}, {:.0}) r {} hits {} for {damage}", b.x, b.y, b.radius, t.name);
+                info!("{:?} by {} hits {} for {damage}", b.kind, b.owner, t.name);
             }
         }
         if !hits.is_empty() {
@@ -427,9 +1057,27 @@ impl Game {
         self.queue_deaths();
     }
 
+    /// `sc_expl_damage_at_point`, at a tank's base point.
+    fn damage_at(&self, b: &Blast, x: f64, y: f64) -> i32 {
+        let r2 = b.radius * b.radius;
+        if r2 <= 0.0 {
+            return 0;
+        }
+        let at = |cx: f64, cy: f64| {
+            let (dx, dy) = (self.land.dx(cx, x), y - cy);
+            (b.force * (1.0 - (dx * dx + dy * dy) / r2)).round().max(0.0) as i32
+        };
+        match b.kind {
+            BlastKind::Normal | BlastKind::Plasma => at(b.x, b.y),
+            // Burning napalm hurts from every cell near the tank.
+            BlastKind::Napalm => b.spill.iter().map(|&(cx, cy)| at(cx as f64, cy as f64)).sum(),
+            BlastKind::Riot | BlastKind::Dirt | BlastKind::LiquidDirt => 0,
+        }
+    }
+
     /// Tanks out of life explode: a small blast, a medium one half the
-    /// time, a large one a tenth of those (`sc_player_death`; its
-    /// one-in-ten napalm death waits for napalm).
+    /// time, a large one a tenth of those; or one time in ten, napalm
+    /// (`sc_player_death`).
     fn queue_deaths(&mut self) -> bool {
         let mut any = false;
         for i in 0..self.tanks.len() {
@@ -450,22 +1098,35 @@ impl Game {
             let line = if owner == i { format!("{name} destroyed itself!") } else { format!("{killer} destroyed {name}!") };
             say(&mut self.message, &line);
             info!("{name} destroyed by {killer}");
-            let mut stages = vec![SMALL_EXPLOSION];
+            if self.rng.random_range(0..10) == 0 {
+                let (r, f, liquid) = DEATH_NAPALM;
+                let mut b = Blast::new(BlastKind::Napalm, x, y + 1.0, r, f, owner);
+                b.spill = self.land.spill(x as i32, y as i32 + 1, liquid, &mut self.rng);
+                self.add_blast(b);
+                continue;
+            }
+            let mut stages = vec![(SMALL_EXPLOSION, BlastKind::Normal)];
             if self.rng.random::<f64>() < 0.5 {
-                stages.push(MEDIUM_EXPLOSION);
+                stages.push((MEDIUM_EXPLOSION, BlastKind::Normal));
                 if self.rng.random::<f64>() < 0.1 {
-                    stages.push(LARGE_EXPLOSION);
+                    stages.push((LARGE_EXPLOSION, BlastKind::Plasma));
                 }
             }
-            for (radius, force) in stages {
-                self.pending.push_back(Blast { x, y, radius, force, owner, age: 0 });
+            let mut delay = 0;
+            for ((radius, force), kind) in stages {
+                let mut b = Blast::new(kind, x, y, radius, force, owner);
+                b.delay = delay;
+                delay += b.grow;
+                self.add_blast(b);
             }
         }
-        if any {
-            self.phase = Phase::Blast;
+        if any && self.phase == Phase::Settle {
+            self.phase = Phase::Action;
         }
         any
     }
+
+    // ---- Settling and turns ----------------------------------------------
 
     fn tick_settle(&mut self) {
         let dirt = self.land.drop_cycle(DIRT_DROP_PER_TICK);
@@ -519,6 +1180,9 @@ impl Game {
             next = (next + 1) % n;
         }
         self.turn = next;
+        if self.cfg.dynamic_wind {
+            self.wind = physics::update_wind(self.wind, self.cfg.max_wind, &mut self.rng);
+        }
         // Power can't exceed what's left of life.
         let t = &mut self.tanks[next];
         t.power = t.power.min(t.life);
@@ -531,6 +1195,21 @@ impl Game {
         order.sort_by_key(|&i| (std::cmp::Reverse(self.tanks[i].wins), std::cmp::Reverse(self.tanks[i].kills)));
         order
     }
+}
+
+/// A parabola from a to b rising `height` above a, for spider legs.
+fn arc(a: (f64, f64), b: (f64, f64), height: f64) -> Vec<(f64, f64)> {
+    let top = a.1.max(b.1) + height;
+    let n = 24;
+    (0..=n)
+        .map(|i| {
+            let f = i as f64 / n as f64;
+            let x = a.0 + (b.0 - a.0) * f;
+            // Quadratic through a, the peak and b.
+            let base = a.1 + (b.1 - a.1) * f;
+            (x, base + 4.0 * f * (1.0 - f) * (top - (a.1 + b.1) / 2.0))
+        })
+        .collect()
 }
 
 /// Add to the turn's running message.
@@ -551,20 +1230,59 @@ fn supported(land: &Land, t: &Tank) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::weapons::DEFAULT_DEF;
+
+    fn game_with(players: usize, f: impl FnOnce(&mut Config)) -> Game {
+        let mut cfg = Config {
+            players,
+            rounds: 3,
+            generator: Some(Generator::Plains),
+            seed: 1,
+            max_wind: 0.0,
+            walls: Walls::Concrete,
+            ..Config::default()
+        };
+        f(&mut cfg);
+        Game::new(cfg, Arsenal::parse(DEFAULT_DEF).unwrap())
+    }
 
     fn game(players: usize) -> Game {
-        Game::new(Config { players, rounds: 3, generator: Some(Generator::Plains), bumpiness: 50.0, seed: 1 })
+        game_with(players, |_| {})
     }
 
     fn run_turn(g: &mut Game) {
         g.fire();
-        for _ in 0..100_000 {
+        for _ in 0..200_000 {
             g.tick();
-            if g.phase != Phase::Flight && g.phase != Phase::Blast && g.phase != Phase::Settle {
+            if g.phase != Phase::Action && g.phase != Phase::Settle {
                 return;
             }
         }
         panic!("turn never ended");
+    }
+
+    fn select(g: &mut Game, name: &str) {
+        let me = g.turn;
+        g.tanks[me].weapon = g.arsenal.find(name).unwrap();
+    }
+
+    /// Fire at a high lob on flat ground so it comes down in the middle.
+    fn lob(g: &mut Game, name: &str) {
+        g.land = Land::empty();
+        g.land.level(400, 400, 100);
+        for t in &mut g.tanks {
+            t.y = 100;
+        }
+        let me = g.turn;
+        g.tanks[me].x = 200;
+        g.tanks[me].angle = 60;
+        g.tanks[me].power = 500;
+        for (i, t) in g.tanks.iter_mut().enumerate() {
+            if i != me {
+                t.x = 760;
+            }
+        }
+        select(g, name);
     }
 
     #[test]
@@ -596,15 +1314,226 @@ mod tests {
         let start = g.tanks[me].muzzle().1;
         g.fire();
         let mut top: f64 = 0.0;
-        while g.phase == Phase::Flight {
+        while !g.shells.is_empty() {
             g.tick();
-            if let Some(s) = &g.shot {
+            if let Some(s) = g.shells.first() {
                 top = top.max(s.y);
             }
         }
         let v = 500.0 * VELOCITY_SCALE;
         let expect = start + v * v / (2.0 * GRAVITY);
         assert!((top - expect).abs() < 1.5, "apex {top}, expected {expect}");
+    }
+
+    #[test]
+    fn wind_pushes_a_shot() {
+        let land_x = |wind: f64| {
+            let mut g = game_with(2, |c| {
+                c.max_wind = 0.05;
+                c.dynamic_wind = false;
+            });
+            g.wind = wind;
+            lob(&mut g, "Tracer");
+            let me = g.turn;
+            g.tanks[me].power = 600;
+            run_turn(&mut g);
+            g.tanks[me].last_trail.last().unwrap().0
+        };
+        assert!(land_x(0.05) > land_x(0.0) + 50.0);
+        assert!(land_x(-0.05) < land_x(0.0) - 50.0);
+    }
+
+    #[test]
+    fn mirv_splits_at_the_apex_into_five() {
+        let mut g = game(2);
+        lob(&mut g, "MIRV");
+        g.fire();
+        let mut most = 0;
+        while g.phase == Phase::Action {
+            g.tick();
+            most = most.max(g.shells.len());
+        }
+        assert_eq!(most, 5);
+    }
+
+    #[test]
+    fn rubber_walls_bounce_and_concrete_stops() {
+        for (walls, expect_inside) in [(Walls::Rubber, true), (Walls::Concrete, true), (Walls::Wrap, true)] {
+            let mut g = game_with(2, |c| c.walls = walls);
+            lob(&mut g, "Tracer");
+            let me = g.turn;
+            g.tanks[me].angle = 20;
+            g.tanks[me].power = 900;
+            run_turn(&mut g);
+            let end = g.tanks[me].last_trail.last().copied().unwrap();
+            assert_eq!((0.0..800.0).contains(&end.0), expect_inside, "{walls:?} ended at {end:?}");
+            if walls == Walls::Rubber {
+                // It came back off the right wall.
+                assert!(g.tanks[me].last_trail.iter().any(|p| p.0 > 790.0));
+                assert!(end.0 < 790.0);
+            }
+        }
+    }
+
+    #[test]
+    fn napalm_floods_and_burns() {
+        let mut g = game(2);
+        lob(&mut g, "Napalm");
+        g.fire();
+        let mut wet = 0;
+        while g.phase == Phase::Action {
+            g.tick();
+            wet = wet.max(g.blasts.iter().map(|b| b.spill.len()).max().unwrap_or(0));
+        }
+        assert_eq!(wet, 256);
+    }
+
+    #[test]
+    fn dirt_adds_ground_and_riot_takes_it_away() {
+        let mut g = game(2);
+        lob(&mut g, "Dirt Ball");
+        let before: i32 = (0..800).map(|x| g.land.top(x)).sum();
+        run_turn(&mut g);
+        let after: i32 = (0..800).map(|x| g.land.top(x)).sum();
+        assert!(after > before + 1000, "dirt ball added {}", after - before);
+
+        let mut g = game(2);
+        lob(&mut g, "Riot Bomb");
+        run_turn(&mut g);
+        let after: i32 = (0..800).map(|x| g.land.top(x)).sum();
+        assert!(after < before - 500);
+        assert!(g.tanks.iter().all(|t| t.life == MAX_LIFE), "riot bombs don't hurt");
+    }
+
+    #[test]
+    fn riot_charge_clears_a_wedge_in_front() {
+        let mut g = game(2);
+        lob(&mut g, "Riot Charge");
+        let me = g.turn;
+        g.tanks[me].angle = 0;
+        // A low bank of dirt to the right of the tank, low enough that
+        // nothing above the wedge falls back in.
+        let x0 = g.tanks[me].x;
+        for x in x0 + 15..x0 + 60 {
+            for y in 100..112 {
+                g.land.set(x, y, true);
+            }
+        }
+        run_turn(&mut g);
+        let (px, _) = g.tanks[me].pivot();
+        assert!(!g.land.get(px as i32 + 30, 104), "cleared in front");
+        assert!(g.land.get(px as i32 - 30, 99), "untouched behind");
+    }
+
+    #[test]
+    fn roller_rolls_downhill_into_the_valley() {
+        let mut g = game(2);
+        lob(&mut g, "Roller");
+        // A slope down to the right from x 400 to a cliff at 600. Rollers
+        // gain half a unit of speed for every unit they fall, so only a
+        // cliff stops one at the bottom.
+        g.land = Land::empty();
+        for x in 0..800 {
+            let h = if x < 400 { 300 } else if x < 600 { 300 - (x - 400) } else { 300 };
+            for y in 0..h {
+                g.land.set(x, y, true);
+            }
+        }
+        for t in &mut g.tanks {
+            t.y = g.land.top(t.x);
+        }
+        let me = g.turn;
+        g.tanks[me].x = 100;
+        g.tanks[me].y = 300;
+        g.tanks[me].angle = 70;
+        g.tanks[me].power = 420;
+        g.fire();
+        let mut rolled = false;
+        let mut end = (0.0, 0.0);
+        while g.phase == Phase::Action {
+            g.tick();
+            if let Some(s) = g.shells.first() {
+                rolled |= s.rolling();
+            }
+            if let Some(b) = g.blasts.first() {
+                end = (b.x, b.y);
+            }
+        }
+        assert!(rolled);
+        assert!(end.0 > 580.0 && end.0 < 600.0 && end.1 < 110.0, "roller went off at {end:?}");
+    }
+
+    #[test]
+    fn digger_tunnels_and_sandhog_blows_up() {
+        let mut g = game(2);
+        lob(&mut g, "Digger");
+        let before: usize = (0..800).map(|x| (0..400).filter(|&y| g.land.get(x, y)).count()).sum();
+        g.fire();
+        let mut dug = false;
+        while g.phase == Phase::Action {
+            g.tick();
+            dug |= g.shells.iter().any(|s| s.digging());
+        }
+        let after: usize = (0..800).map(|x| (0..400).filter(|&y| g.land.get(x, y)).count()).sum();
+        assert!(dug);
+        assert!(before - after > 500, "digger cleared {}", before - after);
+
+        let mut g = game(2);
+        lob(&mut g, "Sandhog");
+        g.fire();
+        let mut blasted = false;
+        while g.phase == Phase::Action {
+            g.tick();
+            blasted |= !g.blasts.is_empty();
+        }
+        assert!(blasted);
+    }
+
+    #[test]
+    fn leap_frog_bounces_twice() {
+        let mut g = game(2);
+        lob(&mut g, "Leap Frog");
+        g.fire();
+        let mut blasts = 0;
+        let mut seen = std::collections::HashSet::new();
+        while g.phase == Phase::Action {
+            g.tick();
+            // The frog's own blasts, not any tank it destroys.
+            for b in g.blasts.iter().filter(|b| b.force >= 1200.0) {
+                if seen.insert((b.x as i64, b.y as i64)) {
+                    blasts += 1;
+                }
+            }
+        }
+        assert_eq!(blasts, 3);
+    }
+
+    #[test]
+    fn funky_bomb_throws_legs() {
+        let mut g = game(2);
+        lob(&mut g, "Funky Bomb");
+        g.fire();
+        let mut most = 0;
+        while g.phase == Phase::Action {
+            g.tick();
+            most = most.max(g.blasts.len());
+        }
+        assert!((7..=12).contains(&most), "{most} blasts");
+    }
+
+    #[test]
+    fn every_weapon_fires_and_the_turn_ends() {
+        let names: Vec<String> = {
+            let a = Arsenal::parse(DEFAULT_DEF).unwrap();
+            a.selectable().into_iter().map(|i| a.weapons[i].name.clone()).collect()
+        };
+        for walls in [Walls::Wrap, Walls::Rubber, Walls::None] {
+            for name in &names {
+                let mut g = game_with(3, |c| c.walls = walls);
+                select(&mut g, name);
+                run_turn(&mut g);
+            }
+        }
     }
 
     #[test]
@@ -645,5 +1574,36 @@ mod tests {
             }
         }
         panic!("game never ended: round {}, tanks {:?}", g.round, g.tanks.iter().map(|t| (t.x, t.life)).collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)]
+mod timing {
+    use super::*;
+    use crate::weapons::DEFAULT_DEF;
+
+    /// Not a check, a measurement: `cargo test --release timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn ticks_per_weapon() {
+        let a = Arsenal::parse(DEFAULT_DEF).unwrap();
+        for i in a.selectable() {
+            let mut g = Game::new(Config { players: 4, seed: 3, ..Config::default() }, Arsenal::parse(DEFAULT_DEF).unwrap());
+            let me = g.turn;
+            g.tanks[me].weapon = i;
+            g.tanks[me].angle = 70;
+            g.tanks[me].power = 500;
+            g.fire();
+            let start = std::time::Instant::now();
+            let (mut ticks, mut worst, mut shells) = (0, std::time::Duration::ZERO, 0);
+            while g.phase == Phase::Action || g.phase == Phase::Settle {
+                let t = std::time::Instant::now();
+                g.tick();
+                worst = worst.max(t.elapsed());
+                shells = shells.max(g.shells.len());
+                ticks += 1;
+            }
+            println!("{:<18} {:>5} ticks {:>5} shells  worst tick {:>7.2?}  total {:>7.2?}", a.weapons[i].name, ticks, shells, worst, start.elapsed());
+        }
     }
 }
