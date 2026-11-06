@@ -1,0 +1,15 @@
+[package]
+name = "torched"
+version = "0.1.0"
+edition = "2024"
+description = "Artillery on destructible ground in the terminal, after Xscorch"
+license = "GPL-2.0-only"
+
+[dependencies]
+ratatui = "0.30"
+rand = "0.9"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+lto = true

@@ -4,8 +4,21 @@ Artillery on destructible ground, a total conversion of Xscorch (Justin David Sm
 Jacob Luna Lundberg, 2000 to 2009; GPL-2.0-only), itself a free remake of Scorched Earth
 (Wendell Hicken, 1991). Rust + Ratatui, the playfield in Braille.
 
-**Status** (2026-11-06): notes and plan only, no code. Built from scratch in Rust (David,
+**Status** (2026-11-06): 0.1.0 written, waiting to be played: terrain, hot-seat aiming,
+Baby Missile, craters, falling dirt and tanks, rounds. Built from scratch in Rust (David,
 2026-11-06), not as a fork of Gorched. Build order in `ROADMAP.md`.
+
+Code: `src/land.rs` (terrain generators, falling dirt), `src/sim.rs` (the game, no
+terminal), `src/render.rs` (Braille field, HUD), `src/main.rs`. Session log at
+`~/.local/state/torched/session.log`, level from `TORCHED_LOG`.
+
+Found in the source while building 0.1.0:
+
+- Xscorch has eight generators in code, not seven: Valley is there too. Double Mountain is
+  drawn with the Mountain profile (`slscape.c`), so the two look alike.
+- Xscorch has no fall damage ("Currently, parachutes do NOTHING", `accessories.def`). The
+  fall damage here (2 per unit past 3) is ours, for `ROADMAP.md`; see `sim.rs`.
+- Power is capped by life, so a badly hurt tank can't reach far (`sc_player_advance_power`).
 
 ## Name
 
