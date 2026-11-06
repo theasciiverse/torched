@@ -4,14 +4,17 @@ Artillery on destructible ground, a total conversion of Xscorch (Justin David Sm
 Jacob Luna Lundberg, 2000 to 2009; GPL-2.0-only), itself a free remake of Scorched Earth
 (Wendell Hicken, 1991). Rust + Ratatui, the playfield in Braille.
 
-**Status** (2026-11-06): 0.1.0 and 0.2.0 written, neither played yet: terrain, hot-seat
-aiming, the whole arsenal, wind, air, walls, rounds. Until the shop (0.3.0) every weapon
-is free and unlimited, picked with Tab. Built from scratch in Rust (David, 2026-11-06),
-not as a fork of Gorched. Build order in `ROADMAP.md`.
+**Status** (2026-11-07): 0.1.0 to 0.3.0 written, not yet played by a person: terrain,
+hot-seat aiming, the whole arsenal, wind, air, walls, the shop, money, accessories and
+shields, play orders and all-fire-at-once. `--free` gives the old sandbox (every weapon
+free, no shop). Built from scratch in Rust (David, 2026-11-06), not as a fork of Gorched.
+Build order in `ROADMAP.md`.
 
 Code: `src/land.rs` (terrain generators, falling dirt, liquid spills), `src/physics.rs`
-(flight, wind, drag, walls), `src/weapons.rs` (reads `data/weapons.def`), `src/sim.rs`
-(the game, no terminal), `src/render.rs` (Braille field, HUD), `src/main.rs`. Session log
+(flight, wind, drag, walls), `src/defs.rs` (Xscorch's `.def` format), `src/weapons.rs`
+and `src/economy.rs` (read `data/*.def`: weapons, accessories, scorings, prices),
+`src/sim.rs` (the game, no terminal), `src/kit.rs` (shop, money, shields and other
+accessories, also `impl Game`), `src/render.rs` (Braille field, HUD, shop), `src/main.rs`. Session log
 at `~/.local/state/torched/session.log`, level from `TORCHED_LOG`.
 `cargo test --release timing -- --ignored --nocapture` times every weapon's turn.
 
@@ -31,6 +34,14 @@ Found in the source while building 0.1.0:
 - Also ours: rollers head downhill on landing and move at a watchable pace (Xscorch moves
   them sixteen times per step). They gain 0.5 speed per unit fallen, as in Xscorch, so
   they get fast.
+- Unfinished in Xscorch, so ours (0.3.0): Teleporter (to a random clear spot, the turn
+  goes on), Parachute (spent to cancel a fall's damage; the fall damage is ours too),
+  Greedy scoring (Standard, plus a tenth of unused stock's resale value each round,
+  `stockRate` in `scorings.def`).
+- Xscorch plays all-fire-at-once by default; Torched defaults to turn-based, which reads
+  better at one keyboard (`--together` for Xscorch's way). Play order defaults to random
+  as in Xscorch. Batteries restore only 1% of life each, as in Xscorch: weak, but faithful.
+- Contact triggers only matter with `--tunneling` (off by default in Xscorch too).
 - Defaults as in Xscorch: wrap walls, wind up to 0.05 changing every turn. With wrap
   walls, blasts, spills and damage wrap around the edges too.
 

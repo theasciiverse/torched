@@ -1,0 +1,40 @@
+; scorings.def
+; Torched's scorings, from Xscorch 0.2.1 (data/scorings.def, GPL-2.0-only).
+; Greedy was unimplemented in Xscorch; its stockRate is Torched's own.
+
+Basic = scorings_class {
+   scoringName   = "Basic";
+   description   = "A scoring method that emphasizes number of kills.";
+   survivalBonus = 100000;
+   damageBonus   = 0;
+   killBonus     = 40000;
+   damageLoss    = 0;
+   deathLoss     = 20000;
+   suicideLoss   = 100000;
+   fixed         = false;
+};
+
+Standard = scorings_class {
+   scoringName   = "Standard";
+   description   = "A scoring method that penalizes and awards based on tank damage.";
+   survivalBonus = 70000;
+   damageBonus   = 500;
+   killBonus     = 30000;
+   damageLoss    = 250;
+   deathLoss     = 20000;
+   suicideLoss   = 100000;
+   fixed         = false;
+};
+
+Greedy = scorings_class {
+   scoringName   = "Greedy";
+   description   = "Standard, and each round pays a tenth of what your unused stock would sell for.";
+   survivalBonus = 70000;
+   damageBonus   = 500;
+   killBonus     = 30000;
+   damageLoss    = 250;
+   deathLoss     = 20000;
+   suicideLoss   = 100000;
+   fixed         = false;
+   stockRate     = 0.1;
+};

@@ -11,6 +11,8 @@ use ratatui::{
 };
 
 use crate::land;
+use crate::economy::ShieldKind;
+use crate::kit::Aisle;
 use crate::physics::Walls;
 use crate::sim::{BlastKind, Game, Phase, TANK_HEIGHT, TANK_RADIUS, TURRET_RADIUS};
 
@@ -53,11 +55,35 @@ pub fn draw(f: &mut Frame, g: &Game) {
     let [hud, field, foot] =
         Layout::vertical([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)]).areas(area);
     f.render_widget(Hud(g), hud);
-    f.render_widget(Field(g), field);
+    if g.phase != Phase::Shop {
+        f.render_widget(Field(g), field);
+    }
     f.render_widget(Footer(g), foot);
     match g.phase {
         Phase::RoundOver | Phase::GameOver => scores(f, g, field),
+        Phase::Shop => shop(f, g, field),
         _ => {}
+    }
+}
+
+/// Money as "$12,345".
+pub fn cash(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    format!("{}${out}", if n < 0 { "-" } else { "" })
+}
+
+fn shield_colour(kind: Option<ShieldKind>) -> Color {
+    match kind {
+        Some(ShieldKind::Force) => Color::Rgb(255, 230, 130),
+        Some(ShieldKind::Magnetic) => Color::Rgb(175, 150, 255),
+        _ => Color::Rgb(200, 205, 220),
     }
 }
 
@@ -74,8 +100,21 @@ impl Widget for Hud<'_> {
         if matches!(g.phase, Phase::RoundOver | Phase::GameOver) {
             let text = if g.phase == Phase::GameOver { " Game over" } else { " Round over" };
             Line::styled(text, value).style(bar).render(top, buf);
+        } else if g.phase == Phase::Shop {
+            let p = &g.tanks[g.shop.player];
+            Line::from(vec![
+                Span::styled(format!(" {} ", p.name), Style::new().fg(Color::Black).bg(tank_colour(p.colour)).add_modifier(Modifier::BOLD)),
+                Span::styled("  shopping  ", label),
+                Span::styled(cash(p.money), value),
+            ])
+            .style(bar)
+            .render(top, buf);
         } else {
             let weapon = g.weapon(t.weapon);
+            let count = match g.weapon_count(g.turn, t.weapon) {
+                Some(n) => format!(" ×{n}"),
+                None => String::new(),
+            };
             Line::from(vec![
                 Span::styled(format!(" {} ", t.name), Style::new().fg(Color::Black).bg(tank_colour(t.colour)).add_modifier(Modifier::BOLD)),
                 Span::styled("  Angle ", label),
@@ -86,6 +125,7 @@ impl Widget for Hud<'_> {
                 Span::styled(format!("{:>4}", t.life.max(0)), value),
                 Span::styled("  ", label),
                 Span::styled(weapon.name.clone(), Style::new().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(count, label),
             ])
             .style(bar)
             .render(top, buf);
@@ -107,7 +147,37 @@ impl Widget for Hud<'_> {
             spans.push(Span::styled("  Air ", label));
             spans.push(Span::styled(format!("{:.3}", g.cfg.viscosity), value));
         }
-        let right = format!("Round {}/{}  {} ", g.round, g.cfg.rounds, g.generator.name());
+        // What the tank carries that matters now.
+        if matches!(g.phase, Phase::Aim | Phase::Action | Phase::Settle) {
+            let i = g.turn;
+            if let Some(sh) = t.shield {
+                let a = &g.accessories.items[sh.acc];
+                spans.push(Span::styled("  ", label));
+                spans.push(Span::styled(format!("{} {}", a.name, sh.life), Style::new().fg(shield_colour(a.shield))));
+            }
+            let shields = g.count(i, |a| a.shield.is_some());
+            if shields > 0 {
+                spans.push(Span::styled(format!("  Shields {shields}"), label));
+            }
+            let fuel = g.fuel(i);
+            if fuel > 0 {
+                spans.push(Span::styled(format!("  Fuel {fuel}"), label));
+            }
+            let batt = g.count(i, |a| a.battery);
+            if batt > 0 {
+                spans.push(Span::styled(format!("  Batt {batt}"), label));
+            }
+            if g.has(i, |a| a.contact_trigger) {
+                let on = if t.triggers { "on" } else { "off" };
+                spans.push(Span::styled(format!("  Trig {on}"), label));
+            }
+        }
+        let right = if g.phase == Phase::Shop {
+            format!("Round {}/{} ", g.round + 1, g.cfg.rounds)
+        } else {
+            let money = if g.cfg.free { String::new() } else { format!("{}  ", cash(t.money)) };
+            format!("{money}Round {}/{}  {} ", g.round, g.cfg.rounds, g.generator.name())
+        };
         let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         let pad = (area.width as usize).saturating_sub(used + right.chars().count());
         spans.push(Span::raw(" ".repeat(pad)));
@@ -121,12 +191,31 @@ struct Footer<'a>(&'a Game);
 impl Widget for Footer<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let g = self.0;
-        let help = match g.phase {
-            Phase::Aim => "←→ angle  ↑↓ power  Shift: faster  Tab weapon  Space fire  q quit",
-            Phase::RoundOver => "Enter next round  q quit",
-            Phase::GameOver => "Enter new game  q quit",
-            _ => "",
+        let aim_help = || {
+            let i = g.turn;
+            let mut h = String::from("←→↑↓ aim  Tab weapon");
+            for (want, text) in [
+                (g.has(i, |a| a.shield.is_some()), "  s shield"),
+                (g.has(i, |a| a.battery), "  b battery"),
+                (g.fuel(i) > 0, "  a d drive"),
+                (g.has(i, |a| a.contact_trigger), "  c trigger"),
+                (g.has(i, |a| a.teleporter), "  x teleport"),
+            ] {
+                if want {
+                    h.push_str(text);
+                }
+            }
+            h.push_str("  Space fire");
+            h
         };
+        let help = match g.phase {
+            Phase::Aim => aim_help(),
+            Phase::Shop => "↑↓ choose  Enter buy  ← sell  Tab aisle  Space done".into(),
+            Phase::RoundOver => "Enter next round  q quit".into(),
+            Phase::GameOver => "Enter new game  q quit".into(),
+            _ => String::new(),
+        };
+        let help = help.as_str();
         let msg = Span::styled(format!(" {}", g.message), Style::new().fg(AMBER));
         let used = g.message.chars().count() + 1;
         // The message wins when both don't fit.
@@ -244,6 +333,22 @@ impl Widget for Field<'_> {
             // Mark whose turn it is with a pip above the tank.
             if i == g.turn && g.phase == Phase::Aim {
                 c.dot(bx, by - hh - barrel.ceil() as i32 - 2, AMBER, 5);
+            }
+        }
+
+        // Shields: a dome over each tank that has one up, always a little
+        // bigger than the tank's own dots so it shows at any size.
+        for t in g.tanks.iter().filter(|t| t.alive) {
+            let Some(sh) = t.shield else { continue };
+            let a = &g.accessories.items[sh.acc];
+            let colour = shield_colour(a.shield);
+            let (bx, by) = to_dot(t.x as f64, t.y as f64);
+            let r = (TANK_RADIUS + 1) as f64;
+            let (rx, ry) = ((r * sx).max(hw as f64 + 1.5), (r * sy).max(hh as f64 + 1.5));
+            let steps = 48;
+            for k in 0..=steps {
+                let ang = std::f64::consts::PI * k as f64 / steps as f64;
+                c.dot((bx + rx * ang.cos()).round() as i32, (by - ry * ang.sin()).round() as i32, colour, 3);
             }
         }
 
@@ -399,6 +504,74 @@ impl Widget for Field<'_> {
     }
 }
 
+/// The shop: one player at a time, weapons or accessories.
+fn shop(f: &mut Frame, g: &Game, field: Rect) {
+    let p = &g.tanks[g.shop.player];
+    let rows = g.shop_rows();
+    let w = 72.min(field.width);
+    let h = field.height;
+    let r = Rect { x: field.x + (field.width - w) / 2, y: field.y, width: w, height: h };
+    let label = Style::new().fg(AMBER_DIM);
+    let tab = |a: Aisle, text: &'static str| {
+        if g.shop.aisle == a {
+            Span::styled(format!(" {text} "), Style::new().fg(Color::Black).bg(AMBER).add_modifier(Modifier::BOLD))
+        } else {
+            Span::styled(format!(" {text} "), label)
+        }
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(format!("{} ", p.name), Style::new().fg(tank_colour(p.colour)).add_modifier(Modifier::BOLD)),
+            Span::styled(cash(p.money), Style::new().fg(AMBER).add_modifier(Modifier::BOLD)),
+            Span::raw("   "),
+            tab(Aisle::Weapons, "Weapons"),
+            Span::raw(" "),
+            tab(Aisle::Accessories, "Accessories"),
+        ]),
+        Line::styled(format!("{:<24}{:>8}{:>12}{:>6}", "", "bundle", "price", "have"), label),
+    ];
+    // Rows that fit, scrolled to keep the cursor in view; three lines
+    // at the bottom for the description and a gap.
+    let room = (h as usize).saturating_sub(2 + lines.len() + 3).max(1);
+    let first = g.shop.cursor.saturating_sub(room.saturating_sub(1)).min(rows.len().saturating_sub(room));
+    for (k, row) in rows.iter().enumerate().skip(first).take(room) {
+        let selected = k == g.shop.cursor;
+        let mut style = if row.affordable { Style::new().fg(AMBER) } else { Style::new().fg(Color::Rgb(110, 85, 40)) };
+        if selected {
+            style = style.bg(Color::Rgb(70, 50, 10)).add_modifier(Modifier::BOLD);
+        }
+        let have = if row.have > 0 { row.have.to_string() } else { String::new() };
+        let mark = if selected { "▶ " } else { "  " };
+        lines.push(Line::styled(format!("{mark}{:<22}{:>8}{:>12}{:>6}", row.name, row.bundle, cash(row.price as i64), have), style));
+    }
+    while lines.len() < 2 + room {
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::raw(""));
+    if let Some(row) = rows.get(g.shop.cursor) {
+        let note = if row.buy.0 == 0 {
+            "Can't carry more.".to_string()
+        } else if row.buy.0 < row.bundle {
+            format!("{} more for {} (a broken bundle costs extra).", row.buy.0, cash(row.buy.1))
+        } else {
+            String::new()
+        };
+        lines.push(Line::styled(format!("{} {note}", row.description), Style::new().fg(Color::Rgb(220, 210, 190))));
+    }
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(format!(" Shop · round {} of {} ", g.round + 1, g.cfg.rounds))
+                .title_bottom(Line::styled(format!(" {} scoring: {} ", g.scoring.name, g.scoring.description), label))
+                .border_style(Style::new().fg(AMBER))
+                .style(Style::new().bg(Color::Rgb(20, 14, 4))),
+        ),
+        r,
+    );
+}
+
 fn scores(f: &mut Frame, g: &Game, field: Rect) {
     let title = if g.phase == Phase::GameOver { " Final standings " } else { " Scores " };
     let mut lines = vec![Line::styled(g.message.clone(), Style::new().fg(AMBER).add_modifier(Modifier::BOLD)), Line::raw("")];
@@ -407,14 +580,15 @@ fn scores(f: &mut Frame, g: &Game, field: Rect) {
         lines.push(Line::from(vec![
             Span::styled(format!("{}. ", rank + 1), Style::new().fg(AMBER_DIM)),
             Span::styled(format!("{:<10}", t.name), Style::new().fg(tank_colour(t.colour)).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("{:>3} wins {:>3} kills", t.wins, t.kills), Style::new().fg(AMBER)),
+            Span::styled(format!("{:>3} wins {:>3} kills ", t.wins, t.kills), Style::new().fg(AMBER)),
+            Span::styled(if g.cfg.free { String::new() } else { format!("{:>10}", cash(t.money)) }, Style::new().fg(AMBER_DIM)),
         ]));
     }
     lines.push(Line::raw(""));
     let hint = if g.phase == Phase::GameOver { "Enter: new game" } else { "Enter: next round" };
     lines.push(Line::styled(hint, Style::new().fg(AMBER_DIM)));
 
-    let w = 36.min(field.width);
+    let w = 48.min(field.width);
     let h = (lines.len() as u16 + 2).min(field.height);
     let r = Rect { x: field.x + (field.width - w) / 2, y: field.y + (field.height - h) / 2, width: w, height: h };
     f.render_widget(Clear, r);

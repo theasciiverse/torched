@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use crate::defs;
+
 /// The built-in arsenal.
 pub const DEFAULT_DEF: &str = include_str!("../data/weapons.def");
 
@@ -92,32 +94,8 @@ pub struct Arsenal {
 impl Arsenal {
     pub fn parse(src: &str) -> Result<Arsenal, String> {
         let mut weapons = Vec::new();
-        let mut cur: Option<(String, HashMap<String, String>)> = None;
-        for (n, raw) in src.lines().enumerate() {
-            let line = strip_comment(raw).trim();
-            if line.is_empty() {
-                continue;
-            }
-            let at = || format!("line {}", n + 1);
-            if let Some(ident) = line.strip_suffix('{').and_then(|l| l.trim().strip_suffix("weapons_class")) {
-                let ident = ident.trim().trim_end_matches('=').trim();
-                if cur.is_some() {
-                    return Err(format!("{}: weapon {ident} starts inside another", at()));
-                }
-                cur = Some((ident.to_string(), HashMap::new()));
-            } else if line.starts_with('}') {
-                let (ident, fields) = cur.take().ok_or_else(|| format!("{}: '}}' with no weapon open", at()))?;
-                weapons.push(build(ident, fields).map_err(|e| format!("{}: {e}", at()))?);
-            } else if let Some((k, v)) = line.split_once('=') {
-                let (_, fields) = cur.as_mut().ok_or_else(|| format!("{}: field outside a weapon", at()))?;
-                let v = v.trim().trim_end_matches(';').trim().trim_matches('"');
-                fields.insert(k.trim().to_string(), v.to_string());
-            } else {
-                return Err(format!("{}: can't read '{line}'", at()));
-            }
-        }
-        if cur.is_some() {
-            return Err("file ends inside a weapon".into());
+        for b in defs::parse(src, "weapons_class")? {
+            weapons.push(build(&b).map_err(|e| format!("line {}: {e}", b.line))?);
         }
         let by_name: HashMap<String, usize> = weapons.iter().enumerate().map(|(i, w)| (w.name.clone(), i)).collect();
         for w in &mut weapons {
@@ -174,33 +152,12 @@ impl Arsenal {
     }
 }
 
-fn strip_comment(line: &str) -> &str {
-    // ';' starts a comment unless inside quotes.
-    let mut quoted = false;
-    for (i, c) in line.char_indices() {
-        match c {
-            '"' => quoted = !quoted,
-            ';' if !quoted => return &line[..i],
-            _ => {}
-        }
-    }
-    line
-}
-
-fn build(ident: String, f: HashMap<String, String>) -> Result<Weapon, String> {
-    let num = |k: &str| -> Result<f64, String> {
-        f.get(k).map_or(Ok(0.0), |v| v.parse::<f64>().map_err(|_| format!("{ident}: {k} is not a number")))
-    };
-    let flag = |k: &str| f.get(k).is_some_and(|v| v == "true");
-    let list = |k: &str| -> Vec<String> {
-        f.get(k).map(|v| v.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect()).unwrap_or_default()
-    };
-    let raw_name = f.get("weaponName").cloned().ok_or_else(|| format!("{ident}: no weaponName"))?;
-    let (hidden, name) = match raw_name.strip_prefix('!') {
-        Some(n) => (true, n.to_string()),
-        None => (false, raw_name),
-    };
-
+fn build(b: &defs::Block) -> Result<Weapon, String> {
+    let ident = b.ident.clone();
+    let (name, hidden) = b.name("weaponName")?;
+    let num = |k: &str| b.num(k);
+    let flag = |k: &str| b.flag(k);
+    let list = |k: &str| b.list(k);
     let mut state = State::default();
     for s in list("stateFlags") {
         match s.as_str() {
@@ -234,7 +191,7 @@ fn build(ident: String, f: HashMap<String, String>) -> Result<Weapon, String> {
         }
     }
     Ok(Weapon {
-        description: f.get("description").cloned().unwrap_or_default(),
+        description: b.text("description").unwrap_or_default().to_string(),
         hidden,
         arms_level: num("armsLevel")? as u32,
         price: num("price")? as u32,
@@ -250,7 +207,7 @@ fn build(ident: String, f: HashMap<String, String>) -> Result<Weapon, String> {
         state,
         phoenix,
         child: None,
-        child_name: f.get("phoenixChild").filter(|s| !s.is_empty()).cloned(),
+        child_name: b.text("phoenixChild").filter(|s| !s.is_empty()).map(str::to_string),
         dig_length: num("digLength")?,
         tunnel_radius: num("tunnelRadius")?,
         name,

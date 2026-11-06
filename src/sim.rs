@@ -8,6 +8,7 @@ use std::rc::Rc;
 use log::info;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
+use crate::economy::{Accessories, Item, Scoring};
 use crate::land::{self, Generator, Land};
 use crate::physics::{self, BORDERS_EXTEND, GRAVITY, Path, TIMEOUT, VELOCITY_SCALE, Walls};
 use crate::weapons::{Arsenal, Weapon};
@@ -47,6 +48,13 @@ const SMALL_EXPLOSION: (f64, f64) = (40.0, 100.0);
 const MEDIUM_EXPLOSION: (f64, f64) = (120.0, 300.0);
 const LARGE_EXPLOSION: (f64, f64) = (200.0, 700.0);
 const DEATH_NAPALM: (f64, f64, usize) = (13.0, 30.0, 400);
+
+/// Slices of a tick: Xscorch steps in sixteenths (`SC_TRAJ_TIME_SUBSTEP`).
+const SLICES: usize = 8;
+/// Tunnelling (`sphysics.h`): speed kept per unit of dirt, and the speed
+/// below which a shell stops and goes off.
+const TUNNEL_DAMPING: f64 = 0.8;
+const TUNNEL_MIN_VEL: f64 = 0.5;
 
 /// Phoenix numbers (`sphoenix.h`).
 const PROB_AT_RAND: f64 = 0.01;
@@ -96,8 +104,28 @@ pub struct Tank {
     pub weapon: usize,
     /// Where the last shot of this tank flew, kept for aiming.
     pub last_trail: Vec<(f64, f64)>,
-    killed_by: Option<usize>,
-    fall_from: Option<i32>,
+    pub(crate) killed_by: Option<usize>,
+    pub(crate) fall_from: Option<i32>,
+    pub money: i64,
+    /// Weapons held, by arsenal index.
+    pub stock: Vec<u32>,
+    /// Accessories held, by index.
+    pub kit: Vec<u32>,
+    pub shield: Option<Shield>,
+    /// Fuel opened from fuel tanks, in units of distance.
+    pub fuel: u32,
+    /// Contact triggers switched on.
+    pub triggers: bool,
+    pub suicides: u32,
+    /// All-fire-at-once mode: orders given this volley.
+    pub ready: bool,
+}
+
+/// A raised shield: which accessory, and its strength left.
+#[derive(Clone, Copy, Debug)]
+pub struct Shield {
+    pub acc: usize,
+    pub life: i32,
 }
 
 impl Tank {
@@ -106,13 +134,13 @@ impl Tank {
         (self.x as f64, (self.y + TANK_HEIGHT - 1) as f64)
     }
 
-    fn muzzle(&self) -> (f64, f64) {
+    pub(crate) fn muzzle(&self) -> (f64, f64) {
         let (px, py) = self.pivot();
         let a = (self.angle as f64).to_radians();
         (px + (TURRET_RADIUS + 1.0) * a.cos(), py + (TURRET_RADIUS + 1.0) * a.sin())
     }
 
-    fn contains(&self, land: &Land, x: f64, y: f64) -> bool {
+    pub(crate) fn contains(&self, land: &Land, x: f64, y: f64) -> bool {
         self.alive
             && land.dx(self.x as f64, x).abs() <= TANK_RADIUS as f64
             && y >= self.y as f64
@@ -148,6 +176,11 @@ pub struct Shell {
     pub delay: u32,
     /// The shell the tank fired; its trail is kept for aiming.
     root: bool,
+    /// Fired with a contact trigger: goes off on touching dirt even when
+    /// tunnelling is on.
+    triggered: bool,
+    /// Tunnelling through dirt just now.
+    tunnel: bool,
 }
 
 impl Shell {
@@ -281,6 +314,8 @@ pub struct Smoke {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
+    /// Between rounds, each player in turn.
+    Shop,
     Aim,
     /// Shells and blasts under way.
     Action,
@@ -301,6 +336,45 @@ pub struct Config {
     pub max_wind: f64,
     pub dynamic_wind: bool,
     pub viscosity: f64,
+    /// Sandbox: every weapon free and endless, no shop.
+    pub free: bool,
+    pub cash: i64,
+    pub interest: f64,
+    pub dynamic_interest: bool,
+    pub scoring: String,
+    pub arms_level: u32,
+    pub order: Order,
+    /// Everyone aims, then all fire at once (Xscorch's synchronous mode).
+    pub simultaneous: bool,
+    /// Shells burrow through dirt while fast enough (Xscorch's
+    /// tunnelling, off by default there too).
+    pub tunneling: bool,
+}
+
+/// Who goes first each round (`sc_config_order`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    Random,
+    LosersFirst,
+    WinnersFirst,
+    RoundRobin,
+}
+
+impl Order {
+    pub const ALL: [Order; 4] = [Order::Random, Order::LosersFirst, Order::WinnersFirst, Order::RoundRobin];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Order::Random => "random",
+            Order::LosersFirst => "losers-first",
+            Order::WinnersFirst => "winners-first",
+            Order::RoundRobin => "round-robin",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Order> {
+        Order::ALL.into_iter().find(|o| o.name().eq_ignore_ascii_case(s))
+    }
 }
 
 impl Default for Config {
@@ -315,6 +389,15 @@ impl Default for Config {
             max_wind: physics::WIND_DEF,
             dynamic_wind: true,
             viscosity: 0.0,
+            free: false,
+            cash: crate::economy::DEF_CASH,
+            interest: crate::economy::DEF_INTEREST,
+            dynamic_interest: false,
+            scoring: "Standard".into(),
+            arms_level: crate::economy::ARMS_LEVEL_DEF,
+            order: Order::Random,
+            simultaneous: false,
+            tunneling: false,
         }
     }
 }
@@ -324,6 +407,7 @@ enum Hit {
     Land,
     Wall,
     Ground,
+    Shield,
 }
 
 pub struct Game {
@@ -346,14 +430,22 @@ pub struct Game {
     pub clock: u64,
     pub message: String,
     pub round_winner: Option<usize>,
-    rng: StdRng,
+    pub accessories: Rc<Accessories>,
+    /// The scoring in play, scaled to the starting cash.
+    pub scoring: Scoring,
+    pub interest_rate: f64,
+    /// This round's turn order, tank indices.
+    pub order: Vec<usize>,
+    pub shop: crate::kit::ShopState,
+    pub(crate) rng: StdRng,
 }
 
 impl Game {
-    pub fn new(cfg: Config, arsenal: Arsenal) -> Game {
+    pub fn new(cfg: Config, arsenal: Arsenal, accessories: Accessories, scoring: Scoring) -> Game {
         let mut rng = StdRng::seed_from_u64(cfg.seed);
         let arsenal = Rc::new(arsenal);
         let start = arsenal.default_weapon();
+        let (nw, na) = (arsenal.weapons.len(), accessories.items.len());
         let tanks = (0..cfg.players)
             .map(|i| Tank {
                 name: format!("Player {}", i + 1),
@@ -370,6 +462,14 @@ impl Game {
                 last_trail: Vec::new(),
                 killed_by: None,
                 fall_from: None,
+                money: cfg.cash,
+                stock: vec![0; nw],
+                kit: vec![0; na],
+                shield: None,
+                fuel: 0,
+                triggers: false,
+                suicides: 0,
+                ready: false,
             })
             .collect();
         let generator = cfg.generator.unwrap_or_else(|| Generator::random(&mut rng));
@@ -389,12 +489,26 @@ impl Game {
             clock: 0,
             message: String::new(),
             round_winner: None,
+            scoring: scoring.scaled(cfg.cash),
+            interest_rate: cfg.interest,
+            order: Vec::new(),
+            shop: Default::default(),
+            accessories: Rc::new(accessories),
             rng,
             arsenal,
             cfg,
         };
-        g.start_round();
+        g.begin_round();
         g
+    }
+
+    /// Shop first, unless the arsenal is free.
+    fn begin_round(&mut self) {
+        if self.cfg.free {
+            self.start_round();
+        } else {
+            self.begin_shopping();
+        }
     }
 
     pub fn current(&self) -> &Tank {
@@ -405,7 +519,7 @@ impl Game {
         &self.arsenal.weapons[i]
     }
 
-    fn start_round(&mut self) {
+    pub(crate) fn start_round(&mut self) {
         self.round += 1;
         self.generator = self.cfg.generator.unwrap_or_else(|| Generator::random(&mut self.rng));
         self.walls = self.cfg.walls.resolve(&mut self.rng);
@@ -458,8 +572,17 @@ impl Game {
             t.killed_by = None;
             t.fall_from = None;
             t.last_trail.clear();
+            // Shields don't carry over; triggers start off (`sc_player_init_round`).
+            t.shield = None;
+            t.triggers = false;
+            t.ready = false;
+            let w = &self.arsenal.weapons[t.weapon];
+            if !self.cfg.free && !w.infinite() && t.stock[t.weapon] == 0 {
+                t.weapon = self.arsenal.default_weapon();
+            }
         }
-        self.turn = self.rng.random_range(0..n);
+        self.order_round();
+        self.turn = self.order[0];
         self.phase = Phase::Aim;
         self.message = format!(
             "Round {} of {}: {}, {} walls",
@@ -474,14 +597,24 @@ impl Game {
     /// Start the next round, or a fresh game after the last.
     pub fn advance(&mut self) {
         match self.phase {
-            Phase::RoundOver => self.start_round(),
+            Phase::RoundOver => {
+                self.pay_interest();
+                self.begin_round();
+            }
             Phase::GameOver => {
+                let (cash, nw, na) = (self.cfg.cash, self.arsenal.weapons.len(), self.accessories.items.len());
                 for t in &mut self.tanks {
                     t.wins = 0;
                     t.kills = 0;
+                    t.suicides = 0;
+                    t.money = cash;
+                    t.stock = vec![0; nw];
+                    t.kit = vec![0; na];
+                    t.fuel = 0;
                 }
+                self.interest_rate = self.cfg.interest;
                 self.round = 0;
-                self.start_round();
+                self.begin_round();
             }
             _ => {}
         }
@@ -507,7 +640,12 @@ impl Game {
         if self.phase != Phase::Aim {
             return;
         }
-        let list = self.arsenal.selectable();
+        let list: Vec<usize> = self
+            .arsenal
+            .selectable()
+            .into_iter()
+            .filter(|&w| self.cfg.free || self.owns(self.turn, w))
+            .collect();
         let t = &mut self.tanks[self.turn];
         let at = list.iter().position(|&w| w == t.weapon).unwrap_or(0) as i32;
         t.weapon = list[(at + delta).rem_euclid(list.len() as i32) as usize];
@@ -517,7 +655,29 @@ impl Game {
         if self.phase != Phase::Aim {
             return;
         }
-        let t = &self.tanks[self.turn];
+        self.message.clear();
+        if self.cfg.simultaneous {
+            // Orders now; everyone fires once all have given theirs.
+            self.tanks[self.turn].ready = true;
+            if let Some(next) = self.next_alive(|t| !t.ready) {
+                self.turn = next;
+                self.start_turn();
+                return;
+            }
+            let shooters: Vec<usize> = self.order.iter().copied().filter(|&i| self.tanks[i].alive).collect();
+            for i in shooters {
+                self.launch(i);
+                self.tanks[i].ready = false;
+            }
+        } else {
+            self.launch(self.turn);
+        }
+        self.phase = Phase::Action;
+    }
+
+    /// One tank's shot leaves the barrel.
+    fn launch(&mut self, who: usize) {
+        let t = &self.tanks[who];
         let wi = t.weapon;
         let ars = self.arsenal.clone();
         let w = &ars.weapons[wi];
@@ -525,17 +685,23 @@ impl Game {
         let a = (t.angle as f64).to_radians();
         let v = t.power as f64 * VELOCITY_SCALE;
         info!("{} fires {}: angle {} power {}", t.name, w.name, t.angle, t.power);
-        self.message.clear();
-        self.phase = Phase::Action;
+        let triggered = self.use_contact_trigger(who);
+        self.use_weapon(who, wi);
         // Weapons that act as they leave the barrel: riot charges blow a
         // wedge in the turret's direction (`_sc_phoenix_detonate`).
         if w.phoenix.at_tank && w.phoenix.detonate {
-            let owner = self.turn;
-            self.explode(wi, x, y, 1.0, owner, Some(a));
+            self.explode(wi, x, y, 1.0, who, Some(a));
             return;
         }
-        let shell = self.new_shell(wi, self.turn, (x, y), (v * a.cos(), v * a.sin()));
-        self.shells.push(Shell { root: true, ..shell });
+        let vel = (v * a.cos(), v * a.sin());
+        // A Triple Turret fires three of a "triple" weapon, spread along
+        // the line of fire (`_sc_weapon_fire_new`: scatter 3, three children).
+        let shots = if w.state.triple && self.has(who, |a| a.triple_turret) { spread(vel, 3, 3.0) } else { vec![vel] };
+        let middle = shots.len() / 2;
+        for (k, vel) in shots.into_iter().enumerate() {
+            let shell = self.new_shell(wi, who, (x, y), vel);
+            self.shells.push(Shell { root: k == middle, triggered, ..shell });
+        }
     }
 
     fn new_shell(&self, weapon: usize, owner: usize, at: (f64, f64), vel: (f64, f64)) -> Shell {
@@ -553,6 +719,8 @@ impl Game {
             age: 0.0,
             delay: 0,
             root: false,
+            triggered: false,
+            tunnel: false,
         }
     }
 
@@ -567,7 +735,7 @@ impl Game {
                 }
             }
             Phase::Settle => self.tick_settle(),
-            Phase::Aim | Phase::RoundOver | Phase::GameOver => {}
+            Phase::Shop | Phase::Aim | Phase::RoundOver | Phase::GameOver => {}
         }
     }
 
@@ -608,93 +776,154 @@ impl Game {
     }
 
     /// Move a flying shell one tick. False when it's gone.
+    ///
+    /// The tick is cut into slices of a sixteenth of a step, as Xscorch
+    /// steps (`SC_TRAJ_TIME_SUBSTEP`); magnetic shields push between
+    /// slices. Within a slice the path is walked a unit at a time
+    /// (`_sc_traj_traverse_path`), checking walls, shields, tanks and dirt.
     fn fly(&mut self, s: &mut Shell) -> bool {
-        let Motion::Flight { mut path, t } = s.motion else { unreachable!() };
+        let Motion::Flight { mut path, mut t } = s.motion else { unreachable!() };
         let ars = self.arsenal.clone();
         let w = &ars.weapons[s.weapon];
-        let going_up = t == 0.0 || path.at(t).1.1 >= 0.0;
-        let t1 = t + STEPS_PER_TICK;
-        let ((x1, y1), _) = path.at(t1);
-        // Walk the path no more than a unit at a time, as
-        // `_sc_traj_traverse_path` does.
-        let n = (x1 - s.x).abs().max((y1 - s.y).abs()).ceil().clamp(1.0, 4000.0) as usize;
-        let mut offset = 0.0; // time a bounce restarted the path
+        let going_up = s.age == 0.0 || path.at(t).1.1 >= 0.0;
+        let (w_, h_) = (land::WIDTH as f64, land::HEIGHT as f64);
+        let shield_r = (TANK_RADIUS + 1) as f64;
+        let dt = STEPS_PER_TICK / SLICES as f64;
         let mut hit = None;
-        for i in 1..=n {
-            let ts = t + STEPS_PER_TICK * i as f64 / n as f64;
-            let ((mut x, mut y), (vx, vy)) = path.at(ts - offset);
-            let w_ = land::WIDTH as f64;
-            let h_ = land::HEIGHT as f64;
-            let off_side = x < 0.0 || x >= w_;
-            match self.walls {
-                Walls::Wrap if off_side => {
-                    let shift = if x < 0.0 { w_ } else { -w_ };
-                    path.ctr.0 += shift;
-                    x += shift;
-                }
-                Walls::None | Walls::Random if off_side => {
-                    if x < -BORDERS_EXTEND || x > w_ + BORDERS_EXTEND {
-                        s.x = x;
-                        s.y = y;
-                        return false;
+        'slices: for _ in 0..SLICES {
+            let ((xe, ye), _) = path.at(t + dt);
+            let n = (xe - s.x).abs().max((ye - s.y).abs()).ceil().clamp(1.0, 4000.0) as usize;
+            // Local time on the current path; a bounce starts a new one.
+            let (mut base_local, mut base_e) = (t, 0.0);
+            for k in 1..=n {
+                let e = dt * k as f64 / n as f64;
+                let local = base_local + (e - base_e);
+                let ((mut x, mut y), (vx, vy)) = path.at(local);
+                let mut restart = |path: &mut Path, at: (f64, f64), vel: (f64, f64), acc: (f64, f64)| {
+                    *path = Path { ctr: at, vel, acc, ..*path };
+                    base_local = 0.0;
+                    base_e = e;
+                };
+                let off_side = x < 0.0 || x >= w_;
+                match self.walls {
+                    Walls::Wrap if off_side => {
+                        let shift = if x < 0.0 { w_ } else { -w_ };
+                        path.ctr.0 += shift;
+                        x += shift;
                     }
-                }
-                Walls::Concrete if off_side || y >= h_ => {
-                    hit = Some((Hit::Wall, x.clamp(0.0, w_ - 1.0), y.min(h_ - 1.0)));
-                    break;
-                }
-                walls => {
-                    if let Some(e) = walls.elasticity()
-                        && (off_side || y >= h_ || y < 0.0)
-                    {
-                        let (mut nvx, mut nvy) = (vx, vy);
-                        if off_side {
-                            x = x.clamp(0.0, w_ - 1.0);
-                            nvx = -vx * e;
-                        } else {
-                            y = y.clamp(0.0, h_ - 1.0);
-                            nvy = -vy * e;
+                    Walls::None | Walls::Random if off_side => {
+                        if x < -BORDERS_EXTEND || x > w_ + BORDERS_EXTEND {
+                            (s.x, s.y) = (x, y);
+                            s.motion = Motion::Flight { path, t };
+                            return false;
                         }
-                        path = Path { ctr: (x, y), vel: (nvx, nvy), ..path };
-                        offset = ts;
+                    }
+                    Walls::Concrete if off_side || y >= h_ => {
+                        hit = Some((Hit::Wall, x.clamp(0.0, w_ - 1.0), y.min(h_ - 1.0)));
+                        break 'slices;
+                    }
+                    walls => {
+                        if let Some(el) = walls.elasticity()
+                            && (off_side || y >= h_ || y < 0.0)
+                        {
+                            let (mut nvx, mut nvy) = (vx, vy);
+                            if off_side {
+                                x = x.clamp(0.0, w_ - 1.0);
+                                nvx = -vx * el;
+                            } else {
+                                y = y.clamp(0.0, h_ - 1.0);
+                                nvy = -vy * el;
+                            }
+                            let acc = path.acc;
+                            restart(&mut path, (x, y), (nvx, nvy), acc);
+                        }
                     }
                 }
+                if y < 0.0 {
+                    hit = Some((Hit::Ground, x, 0.0));
+                    break 'slices;
+                }
+                if !(0.0..w_).contains(&x) {
+                    // Off the side with no walls: nothing to hit out there.
+                    (s.x, s.y) = (x, y);
+                    continue;
+                }
+                // Shields, crossed from outside to inside
+                // (`sc_shield_would_impact`). Magnetic ones only stop a
+                // sapper; a tank's own shield lets its shots out.
+                if let Some(j) = self.shield_crossed(s, x, y, shield_r, w.state.sapper) {
+                    let sh = self.tanks[j].shield.expect("crossed a shield");
+                    let force = self.accessories.items[sh.acc].shield == Some(crate::economy::ShieldKind::Force);
+                    if force && !w.state.sapper {
+                        // Bounce off the curve (`sc_shield_get_reflection`).
+                        let (tx, ty) = (self.tanks[j].x as f64, self.tanks[j].y as f64);
+                        let (dx, dy) = (self.land.dx(tx, x), y - ty);
+                        let d2 = (dx * dx + dy * dy).max(1e-6);
+                        let radial = (dx * vx + dy * vy) / d2;
+                        let vel = (vx - 2.0 * radial * dx, vy - 2.0 * radial * dy);
+                        let d = d2.sqrt();
+                        let at = (tx + dx / d * (shield_r + 0.1), ty + dy / d * (shield_r + 0.1));
+                        self.absorb_hit(j, false);
+                        let acc = path.acc;
+                        restart(&mut path, at, vel, acc);
+                        (s.x, s.y) = at;
+                        continue;
+                    }
+                    if w.state.liquid {
+                        // Liquids burst against it (`_sc_weapon_track`).
+                        hit = Some((Hit::Shield, x, y));
+                        break 'slices;
+                    }
+                    self.absorb_hit(j, w.state.sapper);
+                    (s.x, s.y) = (x, y);
+                    s.motion = Motion::Flight { path, t };
+                    return false;
+                }
+                let (ix, iy) = (x.round() as i32, y.round() as i32);
+                if self.tanks.iter().any(|tk| tk.contains(&self.land, x, y)) {
+                    hit = Some((Hit::Tank, x, y));
+                    break 'slices;
+                }
+                if self.land.get(ix, iy) {
+                    // Tunnelling (`_sc_traj_hit_land`): slowed by the dirt,
+                    // clearing it, until too slow; a contact trigger stops it.
+                    let slowed = (vx * TUNNEL_DAMPING, vy * TUNNEL_DAMPING);
+                    if self.cfg.tunneling && !s.triggered && slowed.0.hypot(slowed.1) >= TUNNEL_MIN_VEL {
+                        self.land.set(ix, iy, false);
+                        restart(&mut path, (x, y), slowed, (0.0, 0.0));
+                        s.tunnel = true;
+                        (s.x, s.y) = (x, y);
+                        continue;
+                    }
+                    hit = Some((Hit::Land, x, y));
+                    break 'slices;
+                }
+                if s.tunnel {
+                    // Out in the air again: wind and gravity come back.
+                    s.tunnel = false;
+                    restart(&mut path, (x, y), (vx, vy), (self.wind, -GRAVITY));
+                }
+                s.clear = (s.x, s.y);
+                (s.x, s.y) = (x, y);
             }
-            if y < 0.0 {
-                hit = Some((Hit::Ground, x, 0.0));
-                break;
+            t = base_local + (dt - base_e);
+            // Magnetic shields push between slices (`sc_shield_get_deflection`).
+            let v = path.at(t).1;
+            if let Some(nv) = self.deflect(s.owner, s.x, s.y, v) {
+                path = Path { ctr: (s.x, s.y), vel: nv, ..path };
+                t = 0.0;
             }
-            if !(0.0..w_).contains(&x) {
-                // Off the side with no walls: nothing to hit out there.
-                s.x = x;
-                s.y = y;
-                continue;
-            }
-            let (ix, iy) = (x.round() as i32, y.round() as i32);
-            if self.tanks.iter().any(|tk| tk.contains(&self.land, x, y)) {
-                hit = Some((Hit::Tank, x, y));
-                break;
-            }
-            if self.land.get(ix, iy) {
-                hit = Some((Hit::Land, x, y));
-                break;
-            }
-            s.clear = (s.x, s.y);
-            s.x = x;
-            s.y = y;
         }
         s.age += STEPS_PER_TICK;
-        let local = t1 - offset;
-        s.motion = Motion::Flight { path, t: local };
+        s.motion = Motion::Flight { path, t };
 
         if let Some((kind, x, y)) = hit {
-            s.x = x;
-            s.y = y;
+            (s.x, s.y) = (x, y);
             return self.impact(s, kind);
         }
 
         // At the top of its arc (`_sc_weapon_track`).
-        if w.phoenix.at_apex && going_up && path.at(local).1.1 <= 0.0 {
+        if w.phoenix.at_apex && going_up && path.at(t).1.1 <= 0.0 {
             return self.phoenix_split(s);
         }
         // Somewhere along the way, maybe (Black Market MIRVs).
@@ -751,26 +980,9 @@ impl Game {
         if !w.phoenix.scatter || n == 0 {
             return true;
         }
-        let (mut vx, mut vy) = self.velocity(s);
-        let (mut xs, mut ys) = (0.0, 0.0);
-        if n > 1 {
-            let speed = vx.hypot(vy);
-            if speed == 0.0 {
-                xs = w.scatter;
-            } else {
-                xs = w.scatter * vx / speed;
-                ys = w.scatter * vy / speed;
-            }
-            vx -= 0.5 * xs;
-            vy -= 0.5 * ys;
-            xs /= n as f64;
-            ys /= n as f64;
-        }
-        for _ in 0..n {
-            vx += xs;
-            vy += ys;
-            let c = self.new_shell(child, s.owner, (s.x, s.y), (vx, vy));
-            self.shells.push(c);
+        for vel in spread(self.velocity(s), n, w.scatter) {
+            let c = self.new_shell(child, s.owner, (s.x, s.y), vel);
+            self.shells.push(Shell { triggered: s.triggered, ..c });
         }
         false
     }
@@ -1082,13 +1294,29 @@ impl Game {
             if !t.alive {
                 continue;
             }
-            let damage = self.damage_at(b, t.x as f64, t.y as f64);
-            if damage > 0 {
-                let t = &mut self.tanks[i];
-                t.life -= damage;
-                t.killed_by = Some(b.owner);
-                hits.push(format!("{} -{}", t.name, damage));
-                info!("{:?} by {} hits {} for {damage}", b.kind, b.owner, t.name);
+            let raw = self.damage_at(b, t.x as f64, t.y as f64);
+            if raw <= 0 {
+                continue;
+            }
+            // Shields take it first (`sc_shield_absorb_explosion`).
+            let damage = self.absorb_damage(i, raw, b.kind == BlastKind::Napalm);
+            if damage <= 0 {
+                hits.push(format!("{} shield -{raw}", self.tanks[i].name));
+                continue;
+            }
+            let t = &mut self.tanks[i];
+            t.life -= damage;
+            t.killed_by = Some(b.owner);
+            hits.push(format!("{} -{}", t.name, damage));
+            info!("{:?} by {} hits {} for {damage}", b.kind, b.owner, t.name);
+            // Money changes hands on every hit (`_sc_player_damage`).
+            let (loss, bonus) = (self.scoring.damage_loss, self.scoring.damage_bonus);
+            self.tanks[i].money -= loss;
+            if b.owner != i {
+                self.tanks[b.owner].money += bonus;
+            }
+            if self.tanks[i].life > 0 {
+                self.auto_defense(i);
             }
         }
         if !hits.is_empty() {
@@ -1131,8 +1359,15 @@ impl Game {
             let name = t.name.clone();
             self.tanks[i].alive = false;
             self.tanks[i].life = 0;
+            self.tanks[i].shield = None;
+            // `sc_player_died`, and the kill or suicide.
+            self.tanks[i].money -= self.scoring.death_loss;
             if owner != i {
                 self.tanks[owner].kills += 1;
+                self.tanks[owner].money += self.scoring.kill_bonus;
+            } else {
+                self.tanks[i].suicides += 1;
+                self.tanks[i].money -= self.scoring.suicide_loss;
             }
             let killer = &self.tanks[owner].name;
             let line = if owner == i { format!("{name} destroyed itself!") } else { format!("{killer} destroyed {name}!") };
@@ -1171,7 +1406,12 @@ impl Game {
     fn tick_settle(&mut self) {
         let dirt = self.land.drop_cycle(DIRT_DROP_PER_TICK);
         let mut falling = false;
-        for t in self.tanks.iter_mut().filter(|t| t.alive) {
+        for i in 0..self.tanks.len() {
+            if !self.tanks[i].alive {
+                continue;
+            }
+            let chute = self.accessories.items.iter().position(|a| a.parachute);
+            let t = &mut self.tanks[i];
             let mut moved = 0;
             while moved < TANK_DROP_PER_TICK && t.y > 0 && !supported(&self.land, t) {
                 t.fall_from.get_or_insert(t.y);
@@ -1183,6 +1423,15 @@ impl Game {
             } else if let Some(from) = t.fall_from.take() {
                 let dist = from - t.y;
                 let damage = (dist - FALL_FREE).max(0) * FALL_DAMAGE_PER_UNIT;
+                // A parachute (Torched's own) saves the tank the fall.
+                if damage > 0
+                    && let Some(c) = chute
+                    && t.kit[c] > 0
+                {
+                    t.kit[c] -= 1;
+                    say(&mut self.message, &format!("{}'s parachute opens", t.name));
+                    continue;
+                }
                 if damage > 0 {
                     t.life -= damage;
                     say(&mut self.message, &format!("{} fell {} for {}", t.name, dist, damage));
@@ -1205,6 +1454,8 @@ impl Game {
             self.round_winner = alive.first().copied();
             if let Some(w) = self.round_winner {
                 self.tanks[w].wins += 1;
+                // `sc_player_inc_wins`.
+                self.tanks[w].money += self.scoring.survival_bonus;
             }
             self.message = match self.round_winner {
                 Some(w) => format!("{} wins round {}", self.tanks[w].name, self.round),
@@ -1214,27 +1465,76 @@ impl Game {
             self.phase = if self.round >= self.cfg.rounds { Phase::GameOver } else { Phase::RoundOver };
             return;
         }
-        let n = self.tanks.len();
-        let mut next = (self.turn + 1) % n;
-        while !self.tanks[next].alive {
-            next = (next + 1) % n;
-        }
-        self.turn = next;
+        let next = if self.cfg.simultaneous {
+            for t in &mut self.tanks {
+                t.ready = false;
+            }
+            self.next_alive_from(0, |_| true)
+        } else {
+            self.next_alive(|_| true)
+        };
+        self.turn = next.expect("two tanks are alive");
         if self.cfg.dynamic_wind {
             self.wind = physics::update_wind(self.wind, self.cfg.max_wind, &mut self.rng);
         }
-        // Power can't exceed what's left of life.
-        let t = &mut self.tanks[next];
-        t.power = t.power.min(t.life);
+        self.start_turn();
         self.phase = Phase::Aim;
     }
 
-    /// Standings: indices by wins, then kills.
+    /// The next living tank after the current one in this round's order
+    /// that passes `want`.
+    pub(crate) fn next_alive(&self, want: impl Fn(&Tank) -> bool) -> Option<usize> {
+        let pos = self.order.iter().position(|&i| i == self.turn).unwrap_or(0);
+        self.next_alive_from(pos + 1, want)
+    }
+
+    fn next_alive_from(&self, pos: usize, want: impl Fn(&Tank) -> bool) -> Option<usize> {
+        let n = self.order.len();
+        (0..n).map(|k| self.order[(pos + k) % n]).find(|&i| self.tanks[i].alive && want(&self.tanks[i]))
+    }
+
+    /// A tank's turn begins (`sc_player_init_turn`): power capped by life,
+    /// a solar panel tops up its shield.
+    pub(crate) fn start_turn(&mut self) {
+        let i = self.turn;
+        self.solar(i);
+        let t = &mut self.tanks[i];
+        t.power = t.power.min(t.life);
+    }
+
+    /// Standings: indices by wins, then money.
     pub fn standings(&self) -> Vec<usize> {
         let mut order: Vec<usize> = (0..self.tanks.len()).collect();
-        order.sort_by_key(|&i| (std::cmp::Reverse(self.tanks[i].wins), std::cmp::Reverse(self.tanks[i].kills)));
+        order.sort_by_key(|&i| (std::cmp::Reverse(self.tanks[i].wins), std::cmp::Reverse(self.tanks[i].money)));
         order
     }
+}
+
+/// Velocities for n children spread along the line of flight
+/// (`_sc_phoenix_scatter`): outer ones fastest apart, the middle one, if
+/// any, keeping the parent's.
+fn spread((mut vx, mut vy): (f64, f64), n: u32, scatter: f64) -> Vec<(f64, f64)> {
+    let (mut xs, mut ys) = (0.0, 0.0);
+    if n > 1 {
+        let speed = vx.hypot(vy);
+        if speed == 0.0 {
+            xs = scatter;
+        } else {
+            xs = scatter * vx / speed;
+            ys = scatter * vy / speed;
+        }
+        vx -= 0.5 * xs;
+        vy -= 0.5 * ys;
+        xs /= n as f64;
+        ys /= n as f64;
+    }
+    (0..n)
+        .map(|_| {
+            vx += xs;
+            vy += ys;
+            (vx, vy)
+        })
+        .collect()
 }
 
 /// A parabola from a to b rising `height` above a, for spider legs.
@@ -1268,11 +1568,11 @@ fn supported(land: &Land, t: &Tank) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::weapons::DEFAULT_DEF;
 
-    fn game_with(players: usize, f: impl FnOnce(&mut Config)) -> Game {
+    pub(crate) fn game_with(players: usize, f: impl FnOnce(&mut Config)) -> Game {
         let mut cfg = Config {
             players,
             rounds: 3,
@@ -1280,17 +1580,25 @@ mod tests {
             seed: 1,
             max_wind: 0.0,
             walls: Walls::Concrete,
+            free: true,
             ..Config::default()
         };
         f(&mut cfg);
-        Game::new(cfg, Arsenal::parse(DEFAULT_DEF).unwrap())
+        new_game(cfg)
+    }
+
+    pub(crate) fn new_game(cfg: Config) -> Game {
+        let acc = Accessories::parse(crate::economy::DEFAULT_ACCESSORIES).unwrap();
+        let scorings = Scoring::parse_all(crate::economy::DEFAULT_SCORINGS).unwrap();
+        let scoring = scorings.into_iter().find(|s| s.name == cfg.scoring).unwrap();
+        Game::new(cfg, Arsenal::parse(DEFAULT_DEF).unwrap(), acc, scoring)
     }
 
     fn game(players: usize) -> Game {
         game_with(players, |_| {})
     }
 
-    fn run_turn(g: &mut Game) {
+    pub(crate) fn run_turn(g: &mut Game) {
         g.fire();
         for _ in 0..200_000 {
             g.tick();
@@ -1301,13 +1609,13 @@ mod tests {
         panic!("turn never ended");
     }
 
-    fn select(g: &mut Game, name: &str) {
+    pub(crate) fn select(g: &mut Game, name: &str) {
         let me = g.turn;
         g.tanks[me].weapon = g.arsenal.find(name).unwrap();
     }
 
     /// Fire at a high lob on flat ground so it comes down in the middle.
-    fn lob(g: &mut Game, name: &str) {
+    pub(crate) fn lob(g: &mut Game, name: &str) {
         g.land = Land::empty();
         g.land.level(400, 400, 100);
         for t in &mut g.tanks {
@@ -1628,7 +1936,7 @@ mod timing {
     fn ticks_per_weapon() {
         let a = Arsenal::parse(DEFAULT_DEF).unwrap();
         for i in a.selectable() {
-            let mut g = Game::new(Config { players: 4, seed: 3, ..Config::default() }, Arsenal::parse(DEFAULT_DEF).unwrap());
+            let mut g = super::tests::new_game(Config { players: 4, seed: 3, free: true, ..Config::default() });
             let me = g.turn;
             g.tanks[me].weapon = i;
             g.tanks[me].angle = 70;
