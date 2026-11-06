@@ -361,6 +361,29 @@ impl Widget for Field<'_> {
             }
         }
 
+        // Stars, last and only into empty cells, so they never take a
+        // cell's colour from the ground or a tank.
+        for st in &g.stars {
+            let (x, y) = to_dot(st.x, st.y);
+            let (x, y) = (x as i32, y as i32);
+            if x < 0 || y < 0 || x >= c.w || y >= c.h {
+                continue;
+            }
+            let cell = (y / 4) as usize * c.cols as usize + (x / 2) as usize;
+            if c.bits[cell] != 0 {
+                continue;
+            }
+            let wave = if st.twinkle > 0.0 { 0.55 + 0.45 * (g.clock as f64 * st.twinkle + st.phase).sin() } else { 1.0 };
+            let v = (st.bright * wave).clamp(0.1, 1.0);
+            let (r, gg, b) = match st.tint {
+                1 => (255.0, 210.0, 150.0),
+                2 => (160.0, 190.0, 255.0),
+                _ => (220.0, 225.0, 240.0),
+            };
+            let k = 0.2 + 0.8 * v;
+            c.dot(x, y, Color::Rgb((r * k) as u8, (gg * k) as u8, (b * k) as u8), 0);
+        }
+
         for row in 0..area.height {
             for col in 0..area.width {
                 let i = row as usize * c.cols as usize + col as usize;

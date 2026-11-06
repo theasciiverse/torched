@@ -256,6 +256,22 @@ impl Blast {
     }
 }
 
+/// A star in the night sky, placed fresh each round.
+#[derive(Clone, Copy, Debug)]
+pub struct Star {
+    pub x: f64,
+    pub y: f64,
+    /// 0 to 1.
+    pub bright: f64,
+    /// 0 white, 1 warm, 2 blue.
+    pub tint: u8,
+    /// Some stars twinkle: speed in radians per tick, 0 for steady.
+    pub twinkle: f64,
+    pub phase: f64,
+}
+
+const STARS: usize = 90;
+
 /// Smoke left by a smoke tracer, for the round.
 #[derive(Clone, Debug)]
 pub struct Smoke {
@@ -325,6 +341,9 @@ pub struct Game {
     pub shells: Vec<Shell>,
     pub blasts: Vec<Blast>,
     pub smoke: Vec<Smoke>,
+    pub stars: Vec<Star>,
+    /// Ticks since the game began, for anything that moves on its own.
+    pub clock: u64,
     pub message: String,
     pub round_winner: Option<usize>,
     rng: StdRng,
@@ -366,6 +385,8 @@ impl Game {
             shells: Vec::new(),
             blasts: Vec::new(),
             smoke: Vec::new(),
+            stars: Vec::new(),
+            clock: 0,
             message: String::new(),
             round_winner: None,
             rng,
@@ -394,6 +415,24 @@ impl Game {
         self.shells.clear();
         self.blasts.clear();
         self.smoke.clear();
+        self.stars = (0..STARS)
+            .map(|_| {
+                let r = &mut self.rng;
+                Star {
+                    x: r.random_range(0.0..land::WIDTH as f64),
+                    // Thinner towards the horizon.
+                    y: land::HEIGHT as f64 * (1.0 - r.random::<f64>().powi(2) * 0.85),
+                    bright: 0.25 + 0.75 * r.random::<f64>().powi(3),
+                    tint: match r.random_range(0..10) {
+                        0 => 1,
+                        1 => 2,
+                        _ => 0,
+                    },
+                    twinkle: if r.random_range(0..4) == 0 { r.random_range(0.03..0.09) } else { 0.0 },
+                    phase: r.random_range(0.0..std::f64::consts::TAU),
+                }
+            })
+            .collect();
         self.round_winner = None;
 
         // Spread the tanks out, a slot each in random order, and level a
@@ -518,6 +557,7 @@ impl Game {
     }
 
     pub fn tick(&mut self) {
+        self.clock += 1;
         match self.phase {
             Phase::Action => {
                 self.tick_blasts();
