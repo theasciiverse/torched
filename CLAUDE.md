@@ -4,19 +4,21 @@ Artillery on destructible ground, a total conversion of Xscorch (Justin David Sm
 Jacob Luna Lundberg, 2000 to 2009; GPL-2.0-only), itself a free remake of Scorched Earth
 (Wendell Hicken, 1991). Rust + Ratatui, the playfield in Braille.
 
-**Status** (2026-11-07): 0.1.0 to 0.3.0 written, not yet played by a person: terrain,
+**Status** (2026-11-07): 0.1.0 to 0.4.0 written, not yet played by a person: terrain,
 hot-seat aiming, the whole arsenal, wind, air, walls, the shop, money, accessories and
-shields, play orders and all-fire-at-once. `--free` gives the old sandbox (every weapon
-free, no shop). Built from scratch in Rust (David, 2026-11-06), not as a fork of Gorched.
+shields, play orders and all-fire-at-once, the seven computer players and `--demo`.
+`--free` gives the old sandbox (every weapon free, no shop). Built from scratch in Rust (David, 2026-11-06), not as a fork of Gorched.
 Build order in `ROADMAP.md`.
 
 Code: `src/land.rs` (terrain generators, falling dirt, liquid spills), `src/physics.rs`
 (flight, wind, drag, walls), `src/defs.rs` (Xscorch's `.def` format), `src/weapons.rs`
 and `src/economy.rs` (read `data/*.def`: weapons, accessories, scorings, prices),
 `src/sim.rs` (the game, no terminal), `src/kit.rs` (shop, money, shields and other
-accessories, also `impl Game`), `src/render.rs` (Braille field, HUD, shop), `src/main.rs`. Session log
+accessories, also `impl Game`), `src/ai.rs` (computer players, also `impl Game`), `src/render.rs` (Braille field, HUD, shop), `src/main.rs`. Session log
 at `~/.local/state/torched/session.log`, level from `TORCHED_LOG`.
-`cargo test --release timing -- --ignored --nocapture` times every weapon's turn.
+Measurements, not checks (`cargo test --release <name> -- --ignored --nocapture`):
+`sim::timing` times every weapon's turn, `ai::timing` the length and outcome of demo
+rounds, `ai::accuracy` each computer player's first-shot hit rate.
 
 Found in the source while building 0.1.0:
 
@@ -42,6 +44,19 @@ Found in the source while building 0.1.0:
   better at one keyboard (`--together` for Xscorch's way). Play order defaults to random
   as in Xscorch. Batteries restore only 1% of life each, as in Xscorch: weak, but faithful.
 - Contact triggers only matter with `--tunneling` (off by default in Xscorch too).
+- Computer players (0.4.0) follow `sai/`: Xscorch's budgets, buying orders, yield and
+  precision ratings, victim choice and aiming rules. Insanity is Annihilater in Xscorch
+  ("No one knows ...") and here. Shooter, Spreader and Chooser ignore wind, as in
+  Xscorch, and hit about a quarter of first shots in the default wind; Calculater,
+  Annihilater and Insanity allow for it. Torched's own additions, each because Xscorch's
+  AI fails without it: lobs never reach a ceiling (Xscorch checks only direct shots, so
+  its lobs hit concrete ceilings); victim-keepers learn to aim off from their last miss
+  (the hook Xscorch's `doc/AI` asks for); when the formulas find no shot, the aiming
+  kinds try shots out by simulation; the wind kinds always refine by simulation
+  (Xscorch's optional scan refinement), and the simulation knows about magnetic shields.
+  When only computers are left and no tank loses life for six turns each, the round is a
+  stalemate. `--demo` uses Chooser, Calculater, Annihilater and Insanity: about a minute
+  a round, five rounds in six won.
 - Defaults as in Xscorch: wrap walls, wind up to 0.05 changing every turn. With wrap
   walls, blasts, spills and damage wrap around the edges too.
 

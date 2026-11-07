@@ -1,5 +1,6 @@
 //! Torched: artillery on destructible ground, after Xscorch.
 
+mod ai;
 mod defs;
 mod economy;
 mod kit;
@@ -33,7 +34,12 @@ Torched: artillery on destructible ground
 
 Usage: torched [options]
 
-  --players N      tanks, hot-seat, 2 to 4 (default 2)
+  --players N      people at this keyboard, taking turns (default 2,
+                   or 0 with --ai or --demo)
+  --ai LIST        computer players, comma-separated: moron, shooter,
+                   spreader, chooser, calculater, annihilater, insanity,
+                   random. Eight tanks at most.
+  --demo           computer players only, the game plays itself
   --rounds N       rounds in a game (default 10)
   --terrain NAME   none, canyon, double-mountain, hillside, mountain,
                    plains, traditional, valley, or random (default)
@@ -75,6 +81,8 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut cfg = Config { seed: rand::random(), ..Config::default() };
     let mut weapons = None;
     let mut accessories = None;
+    let mut players_given = false;
+    let mut demo = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -89,10 +97,14 @@ fn parse_args() -> Result<Option<Args>, String> {
             }
             "--players" => {
                 cfg.players = value(&a)?.parse().map_err(|_| "--players takes a number")?;
-                if !(2..=4).contains(&cfg.players) {
-                    return Err("--players must be 2 to 4".into());
+                players_given = true;
+            }
+            "--ai" => {
+                for name in value(&a)?.split(',').filter(|n| !n.trim().is_empty()) {
+                    cfg.ai.push(ai::AiKind::parse(name).ok_or_else(|| format!("unknown computer player '{name}'"))?);
                 }
             }
+            "--demo" => demo = true,
             "--rounds" => {
                 cfg.rounds = value(&a)?.parse().map_err(|_| "--rounds takes a number")?;
                 if cfg.rounds == 0 {
@@ -158,6 +170,20 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--seed" => cfg.seed = value(&a)?.parse().map_err(|_| "--seed takes a number")?,
             other => return Err(format!("unknown option '{other}'\n\n{USAGE}")),
         }
+    }
+    if demo {
+        cfg.players = 0;
+        if cfg.ai.is_empty() {
+            // The sharper ones make a better show.
+            cfg.ai = vec![ai::AiKind::Chooser, ai::AiKind::Calculater, ai::AiKind::Annihilater, ai::AiKind::Insanity];
+        }
+    } else if !players_given && !cfg.ai.is_empty() {
+        // `--ai` alone: one person against the computers.
+        cfg.players = 1;
+    }
+    let total = cfg.players + cfg.ai.len();
+    if !(2..=sim::MAX_TANKS).contains(&total) {
+        return Err(format!("a game needs 2 to {} tanks, people and computers together (got {total})", sim::MAX_TANKS));
     }
     Ok(Some(Args { cfg, weapons, accessories }))
 }
@@ -275,6 +301,15 @@ fn key(game: &mut Game, k: KeyEvent) -> bool {
         || (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL))
     {
         return false;
+    }
+    // Computers shop and aim by themselves; Enter still moves past results.
+    let computer = match game.phase {
+        Phase::Shop => game.is_ai(game.shop.player),
+        Phase::Aim => game.is_ai(game.turn),
+        _ => false,
+    };
+    if computer {
+        return true;
     }
     if game.phase == Phase::Shop {
         match k.code {

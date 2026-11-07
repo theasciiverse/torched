@@ -257,9 +257,14 @@ impl Game {
 
     // ---- Holding things -------------------------------------------------
 
-    /// Has at least one of a weapon (or it's free and endless).
+    /// Has at least one of a weapon a player can fire (or it's free and
+    /// endless). Only-a-child weapons like the BMM Child never count.
     pub fn owns(&self, tank: usize, weapon: usize) -> bool {
-        self.arsenal.weapons[weapon].infinite() || self.tanks[tank].stock[weapon] > 0
+        let w = &self.arsenal.weapons[weapon];
+        if w.indirect || w.hidden || w.state.null {
+            return false;
+        }
+        w.infinite() || self.tanks[tank].stock[weapon] > 0
     }
 
     /// Count to show for a weapon; None when endless.
@@ -403,10 +408,11 @@ impl Game {
         if napalm { 0 } else { through }
     }
 
-    /// Magnetic shields push a shell away (`sc_shield_get_deflection`),
-    /// spending strength to do it. Returns the new velocity, if changed.
-    pub(crate) fn deflect(&mut self, owner: usize, x: f64, y: f64, (mut vx, mut vy): (f64, f64)) -> Option<(f64, f64)> {
-        let mut changed = false;
+    /// Magnetic shields' push on a shell at (x, y), and what each would
+    /// spend making it (`sc_shield_get_deflection`). Changes nothing.
+    pub(crate) fn magnetic_push(&self, owner: usize, x: f64, y: f64) -> ((f64, f64), Vec<(usize, i32)>) {
+        let (mut dvx, mut dvy) = (0.0, 0.0);
+        let mut costs = Vec::new();
         for j in 0..self.tanks.len() {
             let t = &self.tanks[j];
             let Some(sh) = t.shield else { continue };
@@ -422,10 +428,21 @@ impl Game {
             }
             let force = a.repulsion * MAG_ATTENUATION * MAG_ATTENUATION / d2 * MAG_TO_POWER * VELOCITY_SCALE;
             let d = d2.sqrt();
-            vx += force * dx / d;
-            vy += force * dy / d;
-            changed = true;
-            let cost = (force / (VELOCITY_SCALE * MAG_TO_COST)).round() as i32;
+            dvx += force * dx / d;
+            dvy += force * dy / d;
+            costs.push((j, (force / (VELOCITY_SCALE * MAG_TO_COST)).round() as i32));
+        }
+        ((dvx, dvy), costs)
+    }
+
+    /// Magnetic shields push a shell away, spending strength to do it.
+    /// Returns the new velocity, if changed.
+    pub(crate) fn deflect(&mut self, owner: usize, x: f64, y: f64, (vx, vy): (f64, f64)) -> Option<(f64, f64)> {
+        let ((dvx, dvy), costs) = self.magnetic_push(owner, x, y);
+        if costs.is_empty() {
+            return None;
+        }
+        for (j, cost) in costs {
             let t = &mut self.tanks[j];
             if let Some(sh) = t.shield.as_mut() {
                 sh.life -= cost;
@@ -434,7 +451,7 @@ impl Game {
                 }
             }
         }
-        changed.then_some((vx, vy))
+        Some((vx + dvx, vy + dvy))
     }
 
     // ---- Other things ---------------------------------------------------

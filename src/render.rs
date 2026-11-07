@@ -19,11 +19,15 @@ use crate::sim::{BlastKind, Game, Phase, TANK_HEIGHT, TANK_RADIUS, TURRET_RADIUS
 pub const AMBER: Color = Color::Rgb(255, 176, 0);
 const AMBER_DIM: Color = Color::Rgb(150, 100, 20);
 const SKY: Color = Color::Rgb(8, 10, 22);
-const TANK_COLOURS: [Color; 4] = [
+const TANK_COLOURS: [Color; 8] = [
     Color::Rgb(255, 95, 85),
     Color::Rgb(90, 200, 255),
     Color::Rgb(130, 235, 110),
     Color::Rgb(235, 130, 255),
+    Color::Rgb(255, 165, 60),
+    Color::Rgb(240, 235, 100),
+    Color::Rgb(80, 225, 195),
+    Color::Rgb(255, 170, 210),
 ];
 const TRAIL_OLD: Color = Color::Rgb(90, 90, 110);
 const BAR: Color = Color::Rgb(25, 18, 5);
@@ -209,6 +213,8 @@ impl Widget for Footer<'_> {
             h
         };
         let help = match g.phase {
+            Phase::Aim if g.is_ai(g.turn) => format!("{} is aiming", g.current().name),
+            Phase::Shop if g.is_ai(g.shop.player) => String::new(),
             Phase::Aim => aim_help(),
             Phase::Shop => "↑↓ choose  Enter buy  ← sell  Tab aisle  Space done".into(),
             Phase::RoundOver => "Enter next round  q quit".into(),

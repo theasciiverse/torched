@@ -84,7 +84,13 @@ const DIGGER_TURN_PROB: f64 = 0.15;
 const LIQUID_STEP: usize = 32;
 const NAPALM_BURN_TICKS: u32 = 90;
 
-pub const TANK_COLOURS: usize = 4;
+pub const TANK_COLOURS: usize = 8;
+pub const MAX_TANKS: usize = 8;
+/// Ticks a round's results stay up when only computers play.
+const AUTO_ADVANCE_TICKS: u32 = 240;
+/// Torched's own: when only computers are left and nobody has been hurt
+/// for this many turns each, the round ends with no winner.
+const STALEMATE_TURNS_EACH: u32 = 6;
 
 #[derive(Clone, Debug)]
 pub struct Tank {
@@ -119,6 +125,8 @@ pub struct Tank {
     pub suicides: u32,
     /// All-fire-at-once mode: orders given this volley.
     pub ready: bool,
+    /// A computer player's mind; None for a person.
+    pub brain: Option<crate::ai::Brain>,
 }
 
 /// A raised shield: which accessory, and its strength left.
@@ -326,7 +334,10 @@ pub enum Phase {
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// People playing at this keyboard.
     pub players: usize,
+    /// Computer players.
+    pub ai: Vec<crate::ai::AiKind>,
     pub rounds: u32,
     /// None draws a random one every round.
     pub generator: Option<Generator>,
@@ -381,6 +392,7 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             players: 2,
+            ai: Vec::new(),
             rounds: 10,
             generator: None,
             bumpiness: land::BUMPINESS_DEF,
@@ -437,6 +449,14 @@ pub struct Game {
     /// This round's turn order, tank indices.
     pub order: Vec<usize>,
     pub shop: crate::kit::ShopState,
+    /// The computer player's shot being lined up.
+    pub plan: Option<crate::ai::Plan>,
+    pub(crate) think_wait: u32,
+    auto_wait: u32,
+    /// Turns in a row in which no tank lost life.
+    quiet_turns: u32,
+    /// Life and shield totals at the last turn's end, to tell.
+    last_health: i64,
     pub(crate) rng: StdRng,
 }
 
@@ -446,9 +466,24 @@ impl Game {
         let arsenal = Rc::new(arsenal);
         let start = arsenal.default_weapon();
         let (nw, na) = (arsenal.weapons.len(), accessories.items.len());
-        let tanks = (0..cfg.players)
+        let kinds: Vec<Option<crate::ai::AiKind>> =
+            (0..cfg.players).map(|_| None).chain(cfg.ai.iter().copied().map(Some)).collect();
+        let names: Vec<String> = kinds
+            .iter()
+            .enumerate()
+            .map(|(i, k)| match k {
+                None => format!("Player {}", i + 1),
+                Some(k) => {
+                    let same = kinds.iter().filter(|o| **o == Some(*k)).count();
+                    let nth = kinds[..i].iter().filter(|o| **o == Some(*k)).count() + 1;
+                    if same > 1 { format!("{} {nth}", k.name()) } else { k.name().to_string() }
+                }
+            })
+            .collect();
+        let tanks = (0..kinds.len())
             .map(|i| Tank {
-                name: format!("Player {}", i + 1),
+                name: names[i].clone(),
+                brain: kinds[i].map(|kind| crate::ai::Brain { kind, real: kind, victim: None, offset: 0.0, last_aim: None }),
                 colour: i % TANK_COLOURS,
                 x: 0,
                 y: 0,
@@ -493,6 +528,11 @@ impl Game {
             interest_rate: cfg.interest,
             order: Vec::new(),
             shop: Default::default(),
+            plan: None,
+            think_wait: 0,
+            auto_wait: 0,
+            quiet_turns: 0,
+            last_health: 0,
             accessories: Rc::new(accessories),
             rng,
             arsenal,
@@ -504,6 +544,7 @@ impl Game {
 
     /// Shop first, unless the arsenal is free.
     fn begin_round(&mut self) {
+        self.ai_new_round();
         if self.cfg.free {
             self.start_round();
         } else {
@@ -582,6 +623,9 @@ impl Game {
             }
         }
         self.order_round();
+        self.plan = None;
+        self.quiet_turns = 0;
+        self.last_health = self.health();
         self.turn = self.order[0];
         self.phase = Phase::Aim;
         self.message = format!(
@@ -726,6 +770,15 @@ impl Game {
 
     pub fn tick(&mut self) {
         self.clock += 1;
+        self.ai_tick();
+        // With nobody at the keyboard, results move on by themselves.
+        if matches!(self.phase, Phase::RoundOver | Phase::GameOver) && !self.has_humans() {
+            self.auto_wait += 1;
+            if self.auto_wait >= AUTO_ADVANCE_TICKS {
+                self.auto_wait = 0;
+                self.advance();
+            }
+        }
         match self.phase {
             Phase::Action => {
                 self.tick_blasts();
@@ -1448,8 +1501,25 @@ impl Game {
         self.end_turn();
     }
 
+    /// Life of everyone still in it, summed. (Shields wearing down
+    /// doesn't count: magnetic ones drain on every near miss.)
+    fn health(&self) -> i64 {
+        self.tanks.iter().filter(|t| t.alive).map(|t| t.life as i64).sum()
+    }
+
     fn end_turn(&mut self) {
         let alive: Vec<usize> = (0..self.tanks.len()).filter(|&i| self.tanks[i].alive).collect();
+        let h = self.health();
+        self.quiet_turns = if h < self.last_health { 0 } else { self.quiet_turns + 1 };
+        self.last_health = h;
+        let computers_only = alive.iter().all(|&i| self.is_ai(i));
+        if alive.len() > 1 && computers_only && self.quiet_turns >= STALEMATE_TURNS_EACH * alive.len() as u32 {
+            self.round_winner = None;
+            self.message = format!("Stalemate: round {} ends with nobody winning", self.round);
+            info!("{}", self.message);
+            self.phase = if self.round >= self.cfg.rounds { Phase::GameOver } else { Phase::RoundOver };
+            return;
+        }
         if alive.len() <= 1 {
             self.round_winner = alive.first().copied();
             if let Some(w) = self.round_winner {
