@@ -26,14 +26,14 @@ const BATTERY_PERCENT: i32 = 1;
 const CLIMB_HEIGHT: i32 = 3;
 
 /// The two lists in the shop.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Aisle {
     #[default]
     Weapons,
     Accessories,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
 pub struct ShopState {
     pub player: usize,
     pub aisle: Aisle,

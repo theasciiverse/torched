@@ -74,13 +74,13 @@ pub fn draw(f: &mut Frame, g: &Game) {
     let [hud, field, foot] =
         Layout::vertical([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)]).areas(area);
     f.render_widget(Hud(g), hud);
-    if g.phase != Phase::Shop {
+    if g.phase != Phase::Shop || g.is_remote(g.shop.player) {
         f.render_widget(Field(g), field);
     }
     f.render_widget(Footer(g), foot);
     match g.phase {
         Phase::RoundOver | Phase::GameOver => scores(f, g, field),
-        Phase::Shop => shop(f, g, field),
+        Phase::Shop if !g.is_remote(g.shop.player) => shop(f, g, field),
         _ => {}
     }
 }
@@ -228,7 +228,8 @@ impl Widget for Footer<'_> {
             h
         };
         let help = match g.phase {
-            Phase::Aim if g.is_ai(g.turn) => format!("{} is aiming", g.current().name),
+            Phase::Aim if g.is_ai(g.turn) || g.is_remote(g.turn) => format!("{} is aiming", g.current().name),
+            Phase::Shop if g.is_remote(g.shop.player) => format!("{} is shopping", g.tanks[g.shop.player].name),
             Phase::Shop if g.is_ai(g.shop.player) => String::new(),
             Phase::Aim => aim_help(),
             Phase::Shop => "↑↓ choose  Enter buy  ← sell  Tab aisle  Space done".into(),
@@ -582,6 +583,65 @@ fn backdrop(f: &mut Frame, bg: &Game) {
     let area = f.area();
     f.render_widget(Block::new().style(Style::new().bg(SKY)), area);
     f.render_widget(Field(bg), area);
+}
+
+/// What the lobby shows.
+pub struct LobbyView<'a> {
+    pub host: bool,
+    pub ticket: Option<&'a str>,
+    pub names: &'a [String],
+    pub seats: usize,
+    pub status: &'a str,
+    pub lan: bool,
+}
+
+/// The network lobby: the ticket to share and who has come.
+pub fn draw_lobby(f: &mut Frame, bg: &Game, v: &LobbyView) {
+    backdrop(f, bg);
+    let area = f.area();
+    let label = Style::new().fg(AMBER_DIM);
+    let mut lines = vec![Line::styled(
+        if v.host { "Hosting a network game" } else { "Joining a network game" },
+        Style::new().fg(AMBER).add_modifier(Modifier::BOLD),
+    )];
+    lines.push(Line::raw(""));
+    if v.host {
+        match v.ticket {
+            Some(t) => {
+                lines.push(Line::styled("Others join with:", label));
+                lines.push(Line::styled(format!("torched --join {t}{}", if v.lan { " --lan" } else { "" }), Style::new().fg(Color::White)));
+                lines.push(Line::styled("(also in ~/.local/state/torched/ticket)", label));
+            }
+            None => lines.push(Line::styled("Getting an address...", label)),
+        }
+        lines.push(Line::raw(""));
+    }
+    lines.push(Line::styled(format!("Players ({} of {} seats taken):", v.names.len().saturating_sub(1), v.seats), label));
+    for (i, n) in v.names.iter().enumerate() {
+        lines.push(Line::styled(format!("  {n}{}", if i == 0 { " (host)" } else { "" }), Style::new().fg(tank_colour(i))));
+    }
+    lines.push(Line::raw(""));
+    if !v.status.is_empty() {
+        lines.push(Line::styled(v.status.to_string(), Style::new().fg(Color::Rgb(255, 150, 110))));
+    }
+    lines.push(Line::styled(
+        if v.host { "Enter start (empty seats go to computers)  q quit" } else { "Waiting for the host to start  q quit" },
+        label,
+    ));
+    let w = (area.width - 2).min(110);
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(" Network ")
+                .border_style(Style::new().fg(AMBER))
+                .style(Style::new().bg(Color::Rgb(16, 11, 4))),
+        ),
+        r,
+    );
 }
 
 /// The title: the name over computers at war, and a short menu.

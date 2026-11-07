@@ -8,7 +8,7 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use crate::land::{self, Land};
 
 /// Xscorch's skies (`sland.h`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sky {
     Night,
     Fire,
@@ -109,6 +109,12 @@ pub struct Fx {
     /// Sounds raised since the last frame took them.
     pub sounds: Vec<Sound>,
     rng: StdRng,
+}
+
+impl Default for Fx {
+    fn default() -> Fx {
+        Fx::new(0)
+    }
 }
 
 impl Fx {

@@ -55,7 +55,7 @@ pub struct Accessory {
     pub parachute: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Accessories {
     pub items: Vec<Accessory>,
 }
@@ -123,7 +123,7 @@ fn build_accessory(b: &defs::Block) -> Result<Accessory, String> {
 }
 
 /// How money is won and lost (`scorings.def`).
-#[derive(Clone, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
 pub struct Scoring {
     pub name: String,
     pub description: String,

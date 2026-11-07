@@ -85,7 +85,7 @@ impl Weapon {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Arsenal {
     pub weapons: Vec<Weapon>,
     by_name: HashMap<String, usize>,

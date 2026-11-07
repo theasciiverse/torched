@@ -21,7 +21,7 @@ const TABLE: usize = 4096;
 const LOOKUP: usize = 4096;
 const PARAMS: usize = 16;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Generator {
     None,
     Canyon,
@@ -223,7 +223,9 @@ impl Profile {
 }
 
 /// The ground bitmap, column-major so a column falls with one copy.
-#[derive(Clone)]
+/// Serialised packed eight cells to a byte.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(into = "PackedLand", try_from = "PackedLand")]
 pub struct Land {
     cells: Vec<bool>,
     /// Wrap walls: x wraps around (`sc_land_translate_x`).
@@ -377,6 +379,35 @@ impl Land {
             moving = true;
         }
         moving
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PackedLand {
+    wrap: bool,
+    bits: Vec<u8>,
+}
+
+impl From<Land> for PackedLand {
+    fn from(l: Land) -> PackedLand {
+        let mut bits = vec![0u8; l.cells.len().div_ceil(8)];
+        for (i, &c) in l.cells.iter().enumerate() {
+            if c {
+                bits[i / 8] |= 1 << (i % 8);
+            }
+        }
+        PackedLand { wrap: l.wrap, bits }
+    }
+}
+
+impl TryFrom<PackedLand> for Land {
+    type Error = String;
+    fn try_from(p: PackedLand) -> Result<Land, String> {
+        if p.bits.len() != (WIDTH * HEIGHT).div_ceil(8) {
+            return Err("land is the wrong size".into());
+        }
+        let cells = (0..WIDTH * HEIGHT).map(|i| p.bits[i / 8] & (1 << (i % 8)) != 0).collect();
+        Ok(Land { cells, wrap: p.wrap })
     }
 }
 

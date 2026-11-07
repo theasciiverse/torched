@@ -6,7 +6,8 @@
 use std::rc::Rc;
 
 use log::info;
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha12Rng as StdRng;
 
 use crate::economy::{Accessories, Item, Scoring};
 use crate::land::{self, Generator, Land};
@@ -92,7 +93,7 @@ const AUTO_ADVANCE_TICKS: u32 = 240;
 /// for this many turns each, the round ends with no winner.
 const STALEMATE_TURNS_EACH: u32 = 6;
 
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct Tank {
     pub name: String,
     pub colour: usize,
@@ -130,7 +131,7 @@ pub struct Tank {
 }
 
 /// A raised shield: which accessory, and its strength left.
-#[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
 pub struct Shield {
     pub acc: usize,
     pub life: i32,
@@ -156,7 +157,7 @@ impl Tank {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
 enum Motion {
     Flight { path: Path, t: f64 },
     Roll { vx: f64 },
@@ -164,7 +165,7 @@ enum Motion {
 }
 
 /// A warhead on its way: flying, rolling or burrowing.
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct Shell {
     pub weapon: usize,
     pub owner: usize,
@@ -201,7 +202,7 @@ impl Shell {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlastKind {
     Normal,
     Plasma,
@@ -211,7 +212,7 @@ pub enum BlastKind {
     LiquidDirt,
 }
 
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct Blast {
     pub kind: BlastKind,
     pub x: f64,
@@ -298,7 +299,7 @@ impl Blast {
 }
 
 /// A star in the night sky, placed fresh each round.
-#[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
 pub struct Star {
     pub x: f64,
     pub y: f64,
@@ -314,13 +315,13 @@ pub struct Star {
 const STARS: usize = 90;
 
 /// Smoke left by a smoke tracer, for the round.
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct Smoke {
     pub owner: usize,
     pub points: Vec<(f64, f64)>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     /// Between rounds, each player in turn.
     Shop,
@@ -332,7 +333,7 @@ pub enum Phase {
     GameOver,
 }
 
-#[derive(Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct Config {
     /// People playing at this keyboard.
     pub players: usize,
@@ -364,7 +365,7 @@ pub struct Config {
 }
 
 /// Who goes first each round (`sc_config_order`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Order {
     Random,
     LosersFirst,
@@ -424,8 +425,11 @@ enum Hit {
     Shield,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Game {
     pub cfg: Config,
+    /// Shared data, not state: every peer loads the same files.
+    #[serde(skip)]
     pub arsenal: Rc<Arsenal>,
     pub land: Land,
     pub generator: Generator,
@@ -443,11 +447,17 @@ pub struct Game {
     /// This round's sky (Random resolved).
     pub sky: crate::fx::Sky,
     /// Effects and sounds, apart from the rules.
+    #[serde(skip)]
     pub fx: crate::fx::Fx,
+    /// Network play: tanks played on another machine. Empty at one
+    /// keyboard.
+    #[serde(skip)]
+    pub remote: Vec<bool>,
     /// Ticks since the game began, for anything that moves on its own.
     pub clock: u64,
     pub message: String,
     pub round_winner: Option<usize>,
+    #[serde(skip)]
     pub accessories: Rc<Accessories>,
     /// The scoring in play, scaled to the starting cash.
     pub scoring: Scoring,
@@ -529,6 +539,7 @@ impl Game {
             stars: Vec::new(),
             sky: crate::fx::Sky::Night,
             fx: crate::fx::Fx::new(cfg.seed),
+            remote: Vec::new(),
             clock: 0,
             message: String::new(),
             round_winner: None,
@@ -558,6 +569,11 @@ impl Game {
         } else {
             self.begin_shopping();
         }
+    }
+
+    /// Played on another machine.
+    pub fn is_remote(&self, tank: usize) -> bool {
+        self.remote.get(tank).copied().unwrap_or(false)
     }
 
     pub fn current(&self) -> &Tank {

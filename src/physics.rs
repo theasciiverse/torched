@@ -17,7 +17,7 @@ pub const BORDERS_EXTEND: f64 = 2500.0;
 /// Steps before a shot gives up (`SC_TRAJ_TIMEOUT`).
 pub const TIMEOUT: f64 = 240.0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Walls {
     Concrete,
     Padded,
@@ -94,7 +94,7 @@ pub fn update_wind(wind: f64, max: f64, rng: &mut impl Rng) -> f64 {
 
 /// A flight path: start, starting velocity, constant acceleration (wind
 /// and gravity) and linear air drag.
-#[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
 pub struct Path {
     pub ctr: (f64, f64),
     pub vel: (f64, f64),

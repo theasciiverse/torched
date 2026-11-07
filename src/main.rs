@@ -1,6 +1,7 @@
 //! Torched: artillery on destructible ground, after Xscorch.
 
 mod ai;
+mod cmd;
 mod defs;
 mod economy;
 mod fx;
@@ -8,6 +9,7 @@ mod input;
 mod kit;
 mod land;
 mod menu;
+mod net;
 mod physics;
 mod render;
 mod sim;
@@ -66,6 +68,11 @@ Usage: torched [options]
   --together       everyone aims, then all fire at once
   --tunneling      shells burrow through dirt while fast enough
   --free           every weapon free and endless, no shop
+  --host           host a network game; others join with the ticket shown
+  --seats N        people who may join over the network (default 1)
+  --join TICKET    join a network game
+  --name NAME      your name in a network game
+  --lan            network game on this network only (no internet)
   --weapons FILE   weapons from a weapons.def file
   --accessories F  accessories from an accessories.def file
   --mute           no sound (m toggles it in play)
@@ -89,6 +96,15 @@ struct Args {
     direct: bool,
     weapons: Option<PathBuf>,
     accessories: Option<PathBuf>,
+    net: Option<NetMode>,
+    name: String,
+    lan: bool,
+}
+
+#[derive(Clone)]
+enum NetMode {
+    Host { seats: usize },
+    Join { ticket: String },
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
@@ -100,9 +116,14 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut mute = false;
     let mut quit_after = None;
     let mut demo = false;
+    let mut host = false;
+    let mut seats = 1usize;
+    let mut join = None;
+    let mut name = std::env::var("USER").unwrap_or_else(|_| "Player".into());
+    let mut lan = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
-        if !matches!(a.as_str(), "--mute" | "--weapons" | "--accessories" | "--for") {
+        if !matches!(a.as_str(), "--mute" | "--weapons" | "--accessories" | "--for" | "--name" | "--lan") {
             direct = true;
         }
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -193,6 +214,16 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--together" => cfg.simultaneous = true,
             "--tunneling" | "--tunnelling" => cfg.tunneling = true,
             "--free" => cfg.free = true,
+            "--host" => host = true,
+            "--seats" => {
+                seats = value(&a)?.parse().map_err(|_| "--seats takes a number")?;
+                if !(1..sim::MAX_TANKS).contains(&seats) {
+                    return Err(format!("--seats must be 1 to {}", sim::MAX_TANKS - 1));
+                }
+            }
+            "--join" => join = Some(value(&a)?),
+            "--name" => name = value(&a)?,
+            "--lan" => lan = true,
             "--seed" => cfg.seed = value(&a)?.parse().map_err(|_| "--seed takes a number")?,
             other => return Err(format!("unknown option '{other}'\n\n{USAGE}")),
         }
@@ -207,11 +238,27 @@ fn parse_args() -> Result<Option<Args>, String> {
         // `--ai` alone: one person against the computers.
         cfg.players = 1;
     }
-    let total = cfg.players + cfg.ai.len();
-    if direct && !(2..=sim::MAX_TANKS).contains(&total) {
+    let net = match (host, join) {
+        (true, Some(_)) => return Err("--host and --join don't go together".into()),
+        (true, None) => {
+            if !players_given {
+                cfg.players = 1;
+            }
+            Some(NetMode::Host { seats })
+        }
+        (false, Some(ticket)) => Some(NetMode::Join { ticket }),
+        _ => None,
+    };
+    if net.is_some() {
+        // Over the network turns come one at a time; all-at-once would
+        // need everyone's orders before anyone's shot.
+        cfg.simultaneous = false;
+    }
+    let total = cfg.players + cfg.ai.len() + if let Some(NetMode::Host { seats }) = net { seats } else { 0 };
+    if direct && !matches!(net, Some(NetMode::Join { .. })) && !(2..=sim::MAX_TANKS).contains(&total) {
         return Err(format!("a game needs 2 to {} tanks, people and computers together (got {total})", sim::MAX_TANKS));
     }
-    Ok(Some(Args { cfg, mute, quit_after, direct, weapons, accessories }))
+    Ok(Some(Args { cfg, mute, quit_after, direct, weapons, accessories, net, name, lan }))
 }
 
 fn load_scoring(name: &str) -> Result<Scoring, String> {
@@ -263,7 +310,9 @@ fn main() -> ExitCode {
     // Sound opens before the screen is taken, so any complaint from the
     // sound system lands in the shell, not over the game.
     let mut audio = sound::Audio::new(args.mute || (!args.direct && !opts.sound));
-    let app = if args.direct {
+    let app = if let Some(mode) = args.net.clone() {
+        App::lobby(&data, opts, &args, mode)
+    } else if args.direct {
         match data.game(args.cfg.clone()) {
             Ok(g) => App::direct(g, &data, opts),
             Err(e) => {
@@ -327,7 +376,24 @@ impl Data {
 enum Screen {
     Title,
     Options,
+    Lobby,
     Playing,
+}
+
+/// Before a network game: the link, the ticket, who has joined.
+struct Lobby {
+    link: Option<net::Link>,
+    host: bool,
+    lan: bool,
+    ticket: Option<String>,
+    /// Host first, then those who joined.
+    names: Vec<String>,
+    /// Peer numbers of those who joined, in order.
+    peers: Vec<u8>,
+    me: u8,
+    seats: usize,
+    cfg: Config,
+    status: String,
 }
 
 struct App {
@@ -340,12 +406,65 @@ struct App {
     direct: bool,
     cursor: usize,
     note: String,
+    lobby: Option<Lobby>,
+    /// The network game's lockstep, when playing over the network.
+    net: Option<net::Session>,
 }
 
 impl App {
     fn title(data: &Data, opts: menu::Options) -> App {
         let bg = data.game(menu::title_game_config(rand::random())).expect("built-in data loads");
-        App { screen: Screen::Title, opts, bg, game: None, direct: false, cursor: 0, note: String::new() }
+        App { screen: Screen::Title, opts, bg, game: None, direct: false, cursor: 0, note: String::new(), lobby: None, net: None }
+    }
+
+    fn lobby(data: &Data, opts: menu::Options, args: &Args, mode: NetMode) -> App {
+        let mut app = App::title(data, opts);
+        app.screen = Screen::Lobby;
+        app.direct = true;
+        let (link, host, seats, status) = match mode {
+            NetMode::Host { seats } => (Some(net::Link::host(args.lan)), true, seats, String::new()),
+            NetMode::Join { ticket } => match net::Link::join(&ticket, args.name.clone(), args.lan) {
+                Ok(l) => (Some(l), false, 0, "Connecting to the host...".into()),
+                Err(e) => (None, false, 0, e),
+            },
+        };
+        app.lobby = Some(Lobby {
+            link,
+            host,
+            lan: args.lan,
+            ticket: None,
+            names: if host { vec![args.name.clone()] } else { Vec::new() },
+            peers: Vec::new(),
+            me: 0,
+            seats,
+            cfg: args.cfg.clone(),
+            status,
+        });
+        app
+    }
+
+    /// Leave a game, or the lobby, for the title (or quit if started from
+    /// the command line).
+    fn end_game(&mut self, note: String) -> bool {
+        self.game = None;
+        self.net = None;
+        self.lobby = None;
+        self.note = note;
+        self.screen = Screen::Title;
+        self.cursor = 0;
+        !self.direct || !self.note.is_empty()
+    }
+
+    /// A player's command: applied now at one keyboard, or put in line
+    /// for everyone over the network.
+    fn submit(&mut self, tank: usize, cmd: cmd::Cmd) {
+        if let Some(s) = self.net.as_mut() {
+            s.submit(tank, cmd);
+        } else if let Some(g) = self.game.as_mut()
+            && g.can_apply(tank, &cmd)
+        {
+            g.apply(tank, &cmd);
+        }
     }
 
     fn direct(game: Game, data: &Data, opts: menu::Options) -> App {
@@ -374,6 +493,19 @@ fn run(
         terminal.draw(|f| match (app.screen, &app.game) {
             (Screen::Playing, Some(g)) => render::draw(f, g),
             (Screen::Options, _) => render::draw_options(f, &app.bg, &app.opts.rows(), app.cursor),
+            (Screen::Lobby, _) => {
+                if let Some(l) = &app.lobby {
+                    let v = render::LobbyView {
+                        host: l.host,
+                        ticket: l.ticket.as_deref(),
+                        names: &l.names,
+                        seats: l.seats,
+                        status: &l.status,
+                        lan: l.lan,
+                    };
+                    render::draw_lobby(f, &app.bg, &v);
+                }
+            }
             _ => render::draw_title(f, &app.bg, app.cursor, &app.opts.summary(), &app.note),
         })?;
         next += TICK;
@@ -390,7 +522,11 @@ fn run(
                 }
                 Event::Mouse(m) => {
                     let size = terminal.size()?;
-                    mouse(&mut app, m, (size.width, size.height));
+                    if let Some(k) = mouse(&mut app, m, (size.width, size.height))
+                        && !dispatch(&mut app, k, data, audio)
+                    {
+                        return Ok(());
+                    }
                 }
                 _ => {}
             }
@@ -408,6 +544,17 @@ fn run(
         // The background game plays on, silently, behind the menus.
         app.bg.tick();
         app.bg.fx.sounds.clear();
+        if app.screen == Screen::Lobby {
+            lobby_tick(&mut app);
+        }
+        if let (Some(s), Some(g)) = (app.net.as_mut(), app.game.as_mut())
+            && let Some(end) = s.pump(g)
+        {
+            app.end_game(end);
+        }
+        if let (Some(s), Some(g)) = (app.net.as_mut(), app.game.as_ref()) {
+            s.share_aim(g);
+        }
         if let Some(g) = app.game.as_mut() {
             g.tick();
             for s in std::mem::take(&mut g.fx.sounds) {
@@ -427,19 +574,29 @@ fn dispatch(app: &mut App, k: KeyEvent, data: &Data, audio: &mut sound::Audio) -
         Screen::Playing => {
             if k.code == KeyCode::Char('m') {
                 audio.toggle();
-            } else if let Some(g) = app.game.as_mut()
-                && key(g, k)
-            {
-            } else if app.direct {
-                return false;
-            } else {
-                // Back to the title from a game.
-                app.game = None;
-                app.screen = Screen::Title;
-                app.cursor = 0;
+                return true;
+            }
+            let Some(g) = app.game.as_mut() else { return true };
+            match key(g, k) {
+                Key::Quit => {
+                    if app.direct {
+                        return false;
+                    }
+                    app.end_game(String::new());
+                }
+                Key::Cmd(tank, c) => app.submit(tank, c),
+                Key::Nothing => {}
             }
             true
         }
+        Screen::Lobby => match k.code {
+            KeyCode::Char('q') | KeyCode::Esc => false,
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                start_hosted(app, data);
+                true
+            }
+            _ => true,
+        },
         Screen::Title => title_key(app, k, data, audio),
         Screen::Options => {
             options_key(app, k, audio);
@@ -451,27 +608,26 @@ fn dispatch(app: &mut App, k: KeyEvent, data: &Data, audio: &mut sound::Audio) -
 /// The mouse: in play, press or drag on the field to aim (direction and
 /// distance set angle and power), wheel for fine power, right button to
 /// fire. In the shop and menus, the wheel moves, left chooses or buys,
-/// right sells.
-fn mouse(app: &mut App, m: MouseEvent, (w, h): (u16, u16)) {
-    let key_of = |code| KeyEvent::new(code, KeyModifiers::NONE);
+/// right sells. Returns a key to act on, when it acts like one.
+fn mouse(app: &mut App, m: MouseEvent, (w, h): (u16, u16)) -> Option<KeyEvent> {
+    let key_of = |code| Some(KeyEvent::new(code, KeyModifiers::NONE));
     match app.screen {
         Screen::Playing => {
-            let Some(g) = app.game.as_mut() else { return };
+            let g = app.game.as_mut()?;
             if g.phase == Phase::Shop {
-                match m.kind {
-                    MouseEventKind::ScrollUp => g.shop_move(-1),
-                    MouseEventKind::ScrollDown => g.shop_move(1),
-                    MouseEventKind::Down(MouseButton::Left) => g.shop_buy(),
-                    MouseEventKind::Down(MouseButton::Right) => g.shop_sell(),
-                    _ => {}
-                }
-                return;
+                return match m.kind {
+                    MouseEventKind::ScrollUp => key_of(KeyCode::Up),
+                    MouseEventKind::ScrollDown => key_of(KeyCode::Down),
+                    MouseEventKind::Down(MouseButton::Left) => key_of(KeyCode::Enter),
+                    MouseEventKind::Down(MouseButton::Right) => key_of(KeyCode::Left),
+                    _ => None,
+                };
             }
-            if g.phase != Phase::Aim || g.is_ai(g.turn) {
-                if matches!(m.kind, MouseEventKind::Down(_)) && matches!(g.phase, Phase::RoundOver | Phase::GameOver) {
-                    g.advance();
-                }
-                return;
+            if matches!(g.phase, Phase::RoundOver | Phase::GameOver) {
+                return matches!(m.kind, MouseEventKind::Down(_)).then(|| KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            }
+            if g.phase != Phase::Aim || g.is_ai(g.turn) || g.is_remote(g.turn) {
+                return None;
             }
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
@@ -481,11 +637,12 @@ fn mouse(app: &mut App, m: MouseEvent, (w, h): (u16, u16)) {
                     let wx = (m.column as f64 + 0.5) / w.max(1) as f64 * land::WIDTH as f64;
                     let wy = land::HEIGHT as f64 - (m.row as f64 - top + 0.5) / rows * land::HEIGHT as f64;
                     g.aim_at_point(wx, wy);
+                    None
                 }
-                MouseEventKind::ScrollUp => g.adjust_power(5),
-                MouseEventKind::ScrollDown => g.adjust_power(-5),
-                MouseEventKind::Down(MouseButton::Right) => g.fire(),
-                _ => {}
+                MouseEventKind::ScrollUp => key_of(KeyCode::Up),
+                MouseEventKind::ScrollDown => key_of(KeyCode::Down),
+                MouseEventKind::Down(MouseButton::Right) => key_of(KeyCode::Char(' ')),
+                _ => None,
             }
         }
         Screen::Title | Screen::Options => {
@@ -493,15 +650,142 @@ fn mouse(app: &mut App, m: MouseEvent, (w, h): (u16, u16)) {
                 MouseEventKind::ScrollUp => KeyCode::Up,
                 MouseEventKind::ScrollDown => KeyCode::Down,
                 MouseEventKind::Down(MouseButton::Left) => KeyCode::Enter,
-                _ => return,
+                _ => return None,
             };
             if app.screen == Screen::Options {
-                options_key_simple(app, key_of(code));
+                options_key_simple(app, KeyEvent::new(code, KeyModifiers::NONE));
             } else if code != KeyCode::Enter {
                 app.cursor = match code {
                     KeyCode::Up => (app.cursor + TITLE_ITEMS - 1) % TITLE_ITEMS,
                     _ => (app.cursor + 1) % TITLE_ITEMS,
                 };
+            }
+            None
+        }
+        Screen::Lobby => None,
+    }
+}
+
+/// Network news while in the lobby.
+fn lobby_tick(app: &mut App) {
+    let Some(l) = app.lobby.as_mut() else { return };
+    let Some(link) = l.link.as_ref() else { return };
+    let mut start = None;
+    for ev in link.poll() {
+        match ev {
+            net::In::Ready { ticket } => {
+                if let Some(dir) = std::env::var_os("XDG_STATE_HOME")
+                    .map(PathBuf::from)
+                    .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+                {
+                    let _ = fs::write(dir.join("torched").join("ticket"), format!("{ticket}\n"));
+                }
+                l.ticket = Some(ticket);
+            }
+            net::In::Joined { peer, name } => {
+                if l.peers.len() >= l.seats {
+                    link.to(peer, net::Msg::Refused { why: "the game is full".into() });
+                } else {
+                    info!("{name} joined as peer {peer}");
+                    l.peers.push(peer);
+                    l.names.push(name);
+                    link.all(net::Msg::Lobby { names: l.names.clone() });
+                }
+            }
+            net::In::Left { peer } => {
+                if l.host {
+                    if let Some(i) = l.peers.iter().position(|&p| p == peer) {
+                        l.peers.remove(i);
+                        l.names.remove(i + 1);
+                        link.all(net::Msg::Lobby { names: l.names.clone() });
+                    }
+                } else {
+                    l.status = "The host went away.".into();
+                }
+            }
+            net::In::Got { msg, .. } => match msg {
+                net::Msg::Welcome { peer } => {
+                    l.me = peer;
+                    l.status = "Joined. Waiting for the host to start.".into();
+                }
+                net::Msg::Lobby { names } => l.names = names,
+                net::Msg::Refused { why } => l.status = format!("The host said no: {why}"),
+                net::Msg::Start { cfg, weapons, accessories, names, owners } => start = Some((cfg, weapons, accessories, names, owners)),
+                _ => {}
+            },
+            net::In::Failed(e) => l.status = e,
+        }
+    }
+    if let Some((cfg, weapons, accessories, names, owners)) = start {
+        let data = Data { weapons, accessories };
+        let link = l.link.take().expect("a link");
+        let me = l.me;
+        begin_network_game(app, &data, cfg, names, owners, link, me);
+    }
+}
+
+/// The host starts: those who joined get a tank each, empty seats go to
+/// computers, and everyone gets the game.
+fn start_hosted(app: &mut App, data: &Data) {
+    let Some(l) = app.lobby.as_mut() else { return };
+    if !l.host || l.link.is_none() {
+        return;
+    }
+    let mut cfg = l.cfg.clone();
+    cfg.seed = rand::random();
+    let local = cfg.players;
+    let empty = l.seats - l.peers.len();
+    cfg.players = local + l.peers.len();
+    // Empty seats get computers, after the people.
+    let mut ai = vec![ai::AiKind::Chooser; empty];
+    ai.extend(cfg.ai.iter().copied());
+    cfg.ai = ai;
+    if !(2..=sim::MAX_TANKS).contains(&(cfg.players + cfg.ai.len())) {
+        l.status = format!("A game needs 2 to {} tanks.", sim::MAX_TANKS);
+        return;
+    }
+    let mut owners = vec![net::Owner::Peer(0); local];
+    owners.extend(l.peers.iter().map(|&p| net::Owner::Peer(p)));
+    owners.extend(std::iter::repeat_n(net::Owner::Computer, cfg.ai.len()));
+    let host_name = l.names[0].clone();
+    let mut names: Vec<String> =
+        (0..local).map(|i| if local > 1 { format!("{host_name} {}", i + 1) } else { host_name.clone() }).collect();
+    names.extend(l.names[1..].iter().cloned());
+    let link = l.link.take().expect("a link");
+    link.all(net::Msg::Start {
+        cfg: cfg.clone(),
+        weapons: data.weapons.clone(),
+        accessories: data.accessories.clone(),
+        names: names.clone(),
+        owners: owners.clone(),
+    });
+    begin_network_game(app, data, cfg, names, owners, link, 0);
+}
+
+fn begin_network_game(
+    app: &mut App,
+    data: &Data,
+    cfg: Config,
+    names: Vec<String>,
+    owners: Vec<net::Owner>,
+    link: net::Link,
+    me: u8,
+) {
+    match data.game(cfg) {
+        Ok(mut g) => {
+            for (t, n) in g.tanks.iter_mut().zip(&names) {
+                t.name = n.clone();
+            }
+            g.remote = owners.iter().map(|o| matches!(o, net::Owner::Peer(p) if *p != me)).collect();
+            info!("network game starts, peer {me}, owners {owners:?}");
+            app.game = Some(g);
+            app.net = Some(net::Session::new(link, me, owners));
+            app.lobby = None;
+            app.screen = Screen::Playing;
+        }
+        Err(e) => {
+            if let Some(l) = app.lobby.as_mut() {
+                l.status = e;
             }
         }
     }
@@ -589,35 +873,58 @@ fn options_key(app: &mut App, k: KeyEvent, audio: &mut sound::Audio) {
     app.cursor = app.cursor.min(app.opts.rows().len() - 1);
 }
 
-/// Handle a key; false to quit.
-fn key(game: &mut Game, k: KeyEvent) -> bool {
-    if matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
-        || (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL))
-    {
-        return false;
+enum Key {
+    Quit,
+    Nothing,
+    Cmd(usize, cmd::Cmd),
+}
+
+/// What a key means in play. Turning the dial and browsing the shop
+/// happen here and now; anything that changes the game comes back as a
+/// command, for whoever plays the tank.
+fn key(game: &mut Game, k: KeyEvent) -> Key {
+    use cmd::Cmd;
+    if matches!(k.code, KeyCode::Char('q') | KeyCode::Esc) {
+        return Key::Quit;
     }
-    // Computers shop and aim by themselves; Enter still moves past results.
-    let computer = match game.phase {
-        Phase::Shop => game.is_ai(game.shop.player),
-        Phase::Aim => game.is_ai(game.turn),
-        _ => false,
+    if matches!(game.phase, Phase::RoundOver | Phase::GameOver) {
+        return if matches!(k.code, KeyCode::Enter | KeyCode::Char(' ')) {
+            Key::Cmd(0, Cmd::Advance { round: game.round })
+        } else {
+            Key::Nothing
+        };
+    }
+    let who = match game.phase {
+        Phase::Shop => game.shop.player,
+        Phase::Aim => game.turn,
+        _ => return Key::Nothing,
     };
-    if computer {
-        return true;
+    // Computers and other machines' players act for themselves.
+    if game.is_ai(who) || game.is_remote(who) {
+        return Key::Nothing;
     }
     if game.phase == Phase::Shop {
+        let item = || game.aisle(game.shop.aisle).get(game.shop.cursor).copied();
         match k.code {
             KeyCode::Up => game.shop_move(-1),
             KeyCode::Down => game.shop_move(1),
             KeyCode::PageUp => game.shop_move(-10),
             KeyCode::PageDown => game.shop_move(10),
-            KeyCode::Enter | KeyCode::Right | KeyCode::Char('+') => game.shop_buy(),
-            KeyCode::Left | KeyCode::Char('-') => game.shop_sell(),
             KeyCode::Tab | KeyCode::BackTab => game.shop_switch(),
-            KeyCode::Char(' ') => game.shop_done(),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('+') => {
+                if let Some(item) = item() {
+                    return Key::Cmd(who, Cmd::Buy { aisle: game.shop.aisle, item });
+                }
+            }
+            KeyCode::Left | KeyCode::Char('-') => {
+                if let Some(item) = item() {
+                    return Key::Cmd(who, Cmd::Sell { aisle: game.shop.aisle, item });
+                }
+            }
+            KeyCode::Char(' ') => return Key::Cmd(who, Cmd::ShopDone),
             _ => {}
         }
-        return true;
+        return Key::Nothing;
     }
     let big = k.modifiers.contains(KeyModifiers::SHIFT);
     let (turret, power) = if big { (sim::TURRET_BIGSTEP, sim::POWER_BIGSTEP) } else { (sim::TURRET_STEP, sim::POWER_STEP) };
@@ -631,28 +938,14 @@ fn key(game: &mut Game, k: KeyEvent) -> bool {
         KeyCode::PageDown => game.adjust_power(-sim::POWER_BIGSTEP),
         KeyCode::Tab | KeyCode::Char(']') => game.cycle_weapon(1),
         KeyCode::BackTab | KeyCode::Char('[') => game.cycle_weapon(-1),
-        KeyCode::Char('s') => {
-            game.raise_shield();
-        }
-        KeyCode::Char('b') => {
-            game.use_battery();
-        }
-        KeyCode::Char('c') => game.toggle_triggers(),
-        KeyCode::Char('a') => {
-            game.drive(-1);
-        }
-        KeyCode::Char('d') => {
-            game.drive(1);
-        }
-        KeyCode::Char('x') => {
-            game.teleport();
-        }
-        KeyCode::Char(' ') | KeyCode::Enter => match game.phase {
-            Phase::Aim => game.fire(),
-            Phase::RoundOver | Phase::GameOver => game.advance(),
-            _ => {}
-        },
+        KeyCode::Char('s') => return Key::Cmd(who, Cmd::Shield),
+        KeyCode::Char('b') => return Key::Cmd(who, Cmd::Battery),
+        KeyCode::Char('c') => return Key::Cmd(who, Cmd::Triggers(!game.tanks[who].triggers)),
+        KeyCode::Char('a') => return Key::Cmd(who, Cmd::Drive(-1)),
+        KeyCode::Char('d') => return Key::Cmd(who, Cmd::Drive(1)),
+        KeyCode::Char('x') => return Key::Cmd(who, Cmd::Teleport),
+        KeyCode::Char(' ') | KeyCode::Enter => return Key::Cmd(who, game.aim_of(who, true)),
         _ => {}
     }
-    true
+    Key::Nothing
 }

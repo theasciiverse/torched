@@ -4,11 +4,12 @@ Artillery on destructible ground, a total conversion of Xscorch (Justin David Sm
 Jacob Luna Lundberg, 2000 to 2009; GPL-2.0-only), itself a free remake of Scorched Earth
 (Wendell Hicken, 1991). Rust + Ratatui, the playfield in Braille.
 
-**Status** (2026-11-07): 0.1.0 to 0.5.0 written, not yet played by a person: terrain,
+**Status** (2026-11-07): 0.1.0 to 0.6.0 written, not yet played by a person: terrain,
 hot-seat aiming, the whole arsenal, wind, air, walls, the shop, money, accessories and
 shields, play orders and all-fire-at-once, the seven computer players and `--demo`,
 skies, effects and synthesised sound, a title screen and remembered options, mouse and
-gamepad. `--free` gives the old sandbox (every weapon free, no shop). The catalog entry
+gamepad, network play over iroh. 1.0.0 waits on the last roadmap item: balance played
+through against Xscorch, by people. `--free` gives the old sandbox (every weapon free, no shop). The catalog entry
 is written in `../hub/catalog/torched.{toml,md}`, not committed there. Built from scratch in Rust (David, 2026-11-06), not as a fork of Gorched.
 Build order in `ROADMAP.md`.
 
@@ -19,7 +20,8 @@ and `src/economy.rs` (read `data/*.def`: weapons, accessories, scorings, prices)
 accessories, also `impl Game`), `src/ai.rs` (computer players, also `impl Game`),
 `src/fx.rs` (skies, particles, flash, shake, sound cues), `src/sound.rs` (rodio,
 synthesised), `src/menu.rs` (title, options, saved to `~/.config/torched/options.toml`),
-`src/input.rs` (gamepads via gilrs, mapped to keys), `src/render.rs` (Braille field, HUD, shop), `src/main.rs`. Session log
+`src/input.rs` (gamepads via gilrs, mapped to keys), `src/cmd.rs` (every state change
+as a command, and the game's checksum), `src/net.rs` (iroh link and lockstep session), `src/render.rs` (Braille field, HUD, shop), `src/main.rs`. Session log
 at `~/.local/state/torched/session.log`, level from `TORCHED_LOG`.
 With no options `torched` opens on the title, computers playing behind it; any game option
 on the command line, or `--demo`, starts a game directly (and `q` then quits rather than
@@ -73,6 +75,16 @@ Found in the source while building 0.1.0:
 - Skies are Xscorch's two, Night (default, as there) and Fire, with its gradient colours
   toned down for the terminal. The ground stays Torched's amber-brown, not Xscorch's
   green. Terrain is random each round by default (Xscorch defaults to Traditional).
+- Network play (0.6.0) is Torched's own design, not Xscorch's `snet/`: lockstep on
+  commands. The host numbers every command (`Cmd`) and sends it to all; each peer applies
+  it when its game reaches it (the tank's turn, its shop), so timing never matters. After
+  each command the host sends its game's checksum; a peer that differs (floating point
+  can differ between machines) asks for the host's whole game (postcard, about 60 KB with
+  the land bit-packed) and carries on from it. A player who leaves is replaced by a
+  Chooser. Tickets are base32 postcard `EndpointAddr`s starting `torched`, so they hold
+  direct addresses (`--lan` works with no internet) and, without `--lan`, a relay.
+  All-fire-at-once is off in network games. Tested over real iroh on one machine
+  (`net::tests`), including a forced desync that recovers.
 - Defaults as in Xscorch: wrap walls, wind up to 0.05 changing every turn. With wrap
   walls, blasts, spills and damage wrap around the edges too.
 

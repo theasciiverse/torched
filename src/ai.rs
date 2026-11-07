@@ -12,7 +12,7 @@ use crate::sim::{Game, MAX_POWER, Phase, TANK_HEIGHT, TANK_RADIUS, TURRET_RADIUS
 use crate::weapons::{Arsenal, Weapon};
 
 /// The seven computer players, and Random (`sc_ai_type`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AiKind {
     /// Fires at random.
     Moron,
@@ -75,7 +75,7 @@ impl AiKind {
 }
 
 /// Computer player state on a tank.
-#[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
 pub struct Brain {
     pub kind: AiKind,
     /// This round's kind, when `kind` is Random.
@@ -89,7 +89,7 @@ pub struct Brain {
 }
 
 /// A computer player's shot, being lined up on screen.
-#[derive(Clone, Copy, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug)]
 pub struct Plan {
     pub angle: i32,
     pub power: i32,
