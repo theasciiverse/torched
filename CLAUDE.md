@@ -10,7 +10,7 @@ shields, play orders and all-fire-at-once, the seven computer players and `--dem
 skies, effects and synthesised sound, a title screen and remembered options, mouse and
 gamepad, network play over iroh. 1.0.0 waits on the last roadmap item: balance played
 through against Xscorch, by people. `--free` gives the old sandbox (every weapon free, no shop). The catalog entry
-is written in `../hub/catalog/torched.{toml,md}`, not committed there. Built from scratch in Rust (David, 2026-11-06), not as a fork of Gorched.
+is in `hub/catalog/torched.{toml,md}`; release workflow in `.github/workflows/release.yml` (tags `vX.Y.Z`). Built from scratch in Rust (David, 2026-11-06), not as a fork of Gorched.
 Build order in `ROADMAP.md`.
 
 Code: `src/land.rs` (terrain generators, falling dirt, liquid spills), `src/physics.rs`
