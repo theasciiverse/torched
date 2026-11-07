@@ -15,6 +15,7 @@ const BUMP_HEIGHT_IN_PIXELS: f64 = 30.0;
 const BUMP_WIDTH_IN_PIXELS: f64 = 5.0;
 /// Default bumpiness, 0 to 100 (`SC_LAND_BUMPINESS_DEF`).
 pub const BUMPINESS_DEF: f64 = 50.0;
+pub const BUMPINESS_MAX: f64 = 100.0;
 
 const TABLE: usize = 4096;
 const LOOKUP: usize = 4096;

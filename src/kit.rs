@@ -153,6 +153,7 @@ impl Game {
         }
         t.money -= cost;
         info!("{} buys {q} {} for {cost}", t.name, row.name);
+        self.fx.sound(crate::fx::Sound::Buy);
     }
 
     /// Sell back up to a bundle at half price (`sc_inventory_sell_*`).
@@ -385,6 +386,7 @@ impl Game {
 
     /// A shell stopped by a shield (`sc_shield_absorb_hit`).
     pub(crate) fn absorb_hit(&mut self, tank: usize, sapper: bool) {
+        self.fx.sound(crate::fx::Sound::Shield);
         let t = &mut self.tanks[tank];
         if let Some(sh) = t.shield.as_mut() {
             sh.life -= SHIELD_ABSORB_HIT * if sapper { SHIELD_SAPPER_RATE } else { 1 };

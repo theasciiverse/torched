@@ -360,6 +360,7 @@ pub struct Config {
     /// Shells burrow through dirt while fast enough (Xscorch's
     /// tunnelling, off by default there too).
     pub tunneling: bool,
+    pub sky: crate::fx::Sky,
 }
 
 /// Who goes first each round (`sc_config_order`).
@@ -410,6 +411,7 @@ impl Default for Config {
             order: Order::Random,
             simultaneous: false,
             tunneling: false,
+            sky: crate::fx::Sky::Night,
         }
     }
 }
@@ -438,6 +440,10 @@ pub struct Game {
     pub blasts: Vec<Blast>,
     pub smoke: Vec<Smoke>,
     pub stars: Vec<Star>,
+    /// This round's sky (Random resolved).
+    pub sky: crate::fx::Sky,
+    /// Effects and sounds, apart from the rules.
+    pub fx: crate::fx::Fx,
     /// Ticks since the game began, for anything that moves on its own.
     pub clock: u64,
     pub message: String,
@@ -521,6 +527,8 @@ impl Game {
             blasts: Vec::new(),
             smoke: Vec::new(),
             stars: Vec::new(),
+            sky: crate::fx::Sky::Night,
+            fx: crate::fx::Fx::new(cfg.seed),
             clock: 0,
             message: String::new(),
             round_winner: None,
@@ -564,6 +572,8 @@ impl Game {
         self.round += 1;
         self.generator = self.cfg.generator.unwrap_or_else(|| Generator::random(&mut self.rng));
         self.walls = self.cfg.walls.resolve(&mut self.rng);
+        self.sky = self.cfg.sky.resolve(&mut self.rng);
+        self.fx.clear();
         self.wind = physics::initial_wind(self.cfg.max_wind, &mut self.rng);
         self.land = Land::generate(self.generator, self.cfg.bumpiness, &mut self.rng);
         self.land.wrap = self.walls == Walls::Wrap;
@@ -679,6 +689,20 @@ impl Game {
         }
     }
 
+    /// Aim at a point: the barrel toward it, power by how far it is
+    /// (the whole field's width is full power). For the mouse.
+    pub fn aim_at_point(&mut self, x: f64, y: f64) {
+        if self.phase != Phase::Aim {
+            return;
+        }
+        let t = &mut self.tanks[self.turn];
+        let (px, py) = t.pivot();
+        let (dx, dy) = (x - px, (y - py).max(0.0));
+        t.angle = dy.atan2(dx).to_degrees().round().clamp(0.0, 180.0) as i32;
+        let power = (dx.hypot(dy) / land::WIDTH as f64 * 1.25 * MAX_POWER as f64).round() as i32;
+        t.power = power.clamp(0, MAX_POWER.min(t.life));
+    }
+
     /// Step through the weapons a player can pick.
     pub fn cycle_weapon(&mut self, delta: i32) {
         if self.phase != Phase::Aim {
@@ -729,6 +753,7 @@ impl Game {
         let a = (t.angle as f64).to_radians();
         let v = t.power as f64 * VELOCITY_SCALE;
         info!("{} fires {}: angle {} power {}", t.name, w.name, t.angle, t.power);
+        self.fx.sound(crate::fx::Sound::Fire { power: t.power as f64 });
         let triggered = self.use_contact_trigger(who);
         self.use_weapon(who, wi);
         // Weapons that act as they leave the barrel: riot charges blow a
@@ -770,6 +795,10 @@ impl Game {
 
     pub fn tick(&mut self) {
         self.clock += 1;
+        self.fx.tick(&self.land, self.wind);
+        for b in self.blasts.iter().filter(|b| b.kind == BlastKind::Napalm && b.active() && b.fade() < 0.8) {
+            self.fx.embers(b.wet());
+        }
         self.ai_tick();
         // With nobody at the keyboard, results move on by themselves.
         if matches!(self.phase, Phase::RoundOver | Phase::GameOver) && !self.has_humans() {
@@ -1335,6 +1364,20 @@ impl Game {
 
     /// A blast at full size: its mark on the ground, and damage.
     fn detonate(&mut self, b: &Blast) {
+        use crate::fx::Sound;
+        match b.kind {
+            BlastKind::Normal | BlastKind::Plasma => {
+                self.fx.blast(b.x, b.y, b.radius, true, true);
+                self.fx.sound(Sound::Blast { radius: b.radius, plasma: b.kind == BlastKind::Plasma });
+            }
+            BlastKind::Riot => {
+                self.fx.blast(b.x, b.y, b.radius * 0.6, true, false);
+                self.fx.sound(Sound::Riot);
+            }
+            BlastKind::Dirt => self.fx.sound(Sound::Dirt),
+            BlastKind::Napalm => self.fx.sound(Sound::Napalm),
+            BlastKind::LiquidDirt => self.fx.sound(Sound::Dirt),
+        }
         match b.kind {
             BlastKind::Normal | BlastKind::Plasma => self.land.carve(b.x, b.y, b.radius),
             BlastKind::Riot => self.land.disc(b.x, b.y, b.radius, b.wedge, false),
@@ -1413,6 +1456,7 @@ impl Game {
             self.tanks[i].alive = false;
             self.tanks[i].life = 0;
             self.tanks[i].shield = None;
+            self.fx.sound(crate::fx::Sound::Death);
             // `sc_player_died`, and the kill or suicide.
             self.tanks[i].money -= self.scoring.death_loss;
             if owner != i {
@@ -1527,6 +1571,7 @@ impl Game {
                 // `sc_player_inc_wins`.
                 self.tanks[w].money += self.scoring.survival_bonus;
             }
+            self.fx.sound(crate::fx::Sound::RoundOver);
             self.message = match self.round_winner {
                 Some(w) => format!("{} wins round {}", self.tanks[w].name, self.round),
                 None => format!("Nobody survives round {}", self.round),

@@ -12,6 +12,7 @@ use ratatui::{
 
 use crate::land;
 use crate::economy::ShieldKind;
+use crate::fx::{ParticleKind, Sky};
 use crate::kit::Aisle;
 use crate::physics::Walls;
 use crate::sim::{BlastKind, Game, Phase, TANK_HEIGHT, TANK_RADIUS, TURRET_RADIUS};
@@ -31,6 +32,20 @@ const TANK_COLOURS: [Color; 8] = [
 ];
 const TRAIL_OLD: Color = Color::Rgb(90, 90, 110);
 const BAR: Color = Color::Rgb(25, 18, 5);
+
+/// The ground's colour at a world height: darker deep down.
+fn ground_colour(wy: f64) -> Color {
+    let shade = (wy / land::MAX_HEIGHT).clamp(0.0, 1.0);
+    Color::Rgb((70.0 + 110.0 * shade) as u8, (55.0 + 85.0 * shade) as u8, (30.0 + 30.0 * shade) as u8)
+}
+
+/// A colour darkened, for solid ground behind its dots.
+fn dark(c: Color) -> Color {
+    match c {
+        Color::Rgb(r, g, b) => Color::Rgb((r as f64 * 0.72) as u8, (g as f64 * 0.72) as u8, (b as f64 * 0.72) as u8),
+        c => c,
+    }
+}
 
 /// A colour at half strength, for things left behind.
 fn dim(c: Color) -> Color {
@@ -287,12 +302,7 @@ impl Widget for Field<'_> {
         // Ground, sampled at each dot's centre, shaded by height.
         for dy in 0..c.h {
             let wy = land::HEIGHT as f64 - (dy as f64 + 0.5) / sy;
-            let shade = (wy / land::MAX_HEIGHT).clamp(0.0, 1.0);
-            let colour = Color::Rgb(
-                (70.0 + 110.0 * shade) as u8,
-                (55.0 + 85.0 * shade) as u8,
-                (30.0 + 30.0 * shade) as u8,
-            );
+            let colour = ground_colour(wy);
             for dx in 0..c.w {
                 let wx = (dx as f64 + 0.5) / sx;
                 if g.land.get(wx as i32, wy as i32) {
@@ -472,9 +482,22 @@ impl Widget for Field<'_> {
             }
         }
 
+        // Flying dirt, sparks and embers.
+        for p in &g.fx.particles {
+            let (x, y) = to_dot(p.x, p.y);
+            let f = p.freshness();
+            let colour = match p.kind {
+                ParticleKind::Dirt => ground_colour(p.y.max(0.0) + 60.0),
+                ParticleKind::Spark => Color::Rgb(255, (150.0 + 105.0 * f) as u8, (60.0 + 150.0 * f * f) as u8),
+                ParticleKind::Ember => Color::Rgb(255, (60.0 + 140.0 * f) as u8, 20),
+            };
+            c.dot(x.round() as i32, y.round() as i32, colour, 5);
+        }
+
         // Stars, last and only into empty cells, so they never take a
-        // cell's colour from the ground or a tank.
-        for st in &g.stars {
+        // cell's colour from the ground or a tank. Night skies only.
+        let stars: &[crate::sim::Star] = if g.sky == Sky::Fire { &[] } else { &g.stars };
+        for st in stars {
             let (x, y) = to_dot(st.x, st.y);
             let (x, y) = (x as i32, y as i32);
             if x < 0 || y < 0 || x >= c.w || y >= c.h {
@@ -495,19 +518,144 @@ impl Widget for Field<'_> {
             c.dot(x, y, Color::Rgb((r * k) as u8, (gg * k) as u8, (b * k) as u8), 0);
         }
 
+        // The sky behind, horizon to zenith, lit by a big blast's flash.
+        let ((r0, g0, b0), (r1, g1, b1)) = g.sky.gradient();
+        let flash = g.fx.flash;
+        let sky_at = |row: u16| {
+            let k = 1.0 - row as f64 / area.height.max(1) as f64;
+            let mix = |a: u8, b: u8, lit: f64| {
+                let v = a as f64 + (b as f64 - a as f64) * k;
+                (v + (lit - v) * flash).round() as u8
+            };
+            Color::Rgb(mix(r0, r1, 255.0), mix(g0, g1, 200.0), mix(b0, b1, 120.0))
+        };
+        for row in 0..area.height {
+            let bg = sky_at(row);
+            for col in 0..area.width {
+                if let Some(cell) = buf.cell_mut((area.x + col, area.y + row)) {
+                    cell.set_char(' ').set_bg(bg);
+                }
+            }
+        }
+        // A shake moves the whole picture a cell or two.
+        let shake = g.fx.shake;
+        let (ox, oy) = if shake > 0.0 {
+            let t = g.clock as f64;
+            ((shake * (t * 1.9).sin()).round() as i32, (shake * 0.5 * (t * 2.7).cos()).round() as i32)
+        } else {
+            (0, 0)
+        };
         for row in 0..area.height {
             for col in 0..area.width {
                 let i = row as usize * c.cols as usize + col as usize;
                 if c.bits[i] == 0 {
                     continue;
                 }
+                let (dx, dy) = (col as i32 + ox, row as i32 + oy);
+                if dx < 0 || dy < 0 || dx >= area.width as i32 || dy >= area.height as i32 {
+                    continue;
+                }
                 let ch = char::from_u32(0x2800 + c.bits[i] as u32).unwrap_or(' ');
-                if let Some(cell) = buf.cell_mut((area.x + col, area.y + row)) {
+                if let Some(cell) = buf.cell_mut((area.x + dx as u16, area.y + dy as u16)) {
                     cell.set_char(ch).set_fg(c.colour[i]);
+                    // Solid ground: a full cell of earth gets an earthen
+                    // background, so the ground reads as one mass.
+                    if c.bits[i] == 0xFF && c.prio[i] == 1 {
+                        cell.set_bg(dark(c.colour[i]));
+                    }
                 }
             }
         }
     }
+}
+
+const BANNER: [&str; 5] = [
+    "█████  ███  ████   ████ █   █ █████ ████ ",
+    "  █   █   █ █   █ █     █   █ █     █   █",
+    "  █   █   █ ████  █     █████ ████  █   █",
+    "  █   █   █ █  █  █     █   █ █     █   █",
+    "  █    ███  █   █  ████ █   █ █████ ████ ",
+];
+
+/// The background game's field across the whole screen.
+fn backdrop(f: &mut Frame, bg: &Game) {
+    let area = f.area();
+    f.render_widget(Block::new().style(Style::new().bg(SKY)), area);
+    f.render_widget(Field(bg), area);
+}
+
+/// The title: the name over computers at war, and a short menu.
+pub fn draw_title(f: &mut Frame, bg: &Game, cursor: usize, summary: &str, note: &str) {
+    backdrop(f, bg);
+    let area = f.area();
+    let mut lines: Vec<Line> = Vec::new();
+    // Amber at the top of the letters, burning to red at the foot.
+    let heat = [(255, 200, 60), (255, 170, 40), (255, 135, 30), (240, 95, 25), (210, 60, 20)];
+    for (row, (r, g, b)) in BANNER.iter().zip(heat) {
+        lines.push(Line::styled(*row, Style::new().fg(Color::Rgb(r, g, b)).add_modifier(Modifier::BOLD)));
+    }
+    lines.push(Line::styled("artillery on destructible ground, after Xscorch", Style::new().fg(AMBER_DIM)));
+    lines.push(Line::raw(""));
+    for (i, item) in ["Play", "Options", "Quit"].iter().enumerate() {
+        let style = if i == cursor {
+            Style::new().fg(Color::Black).bg(AMBER).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(AMBER)
+        };
+        lines.push(Line::styled(format!("  {item}  "), style));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(summary.to_string(), Style::new().fg(Color::Rgb(220, 200, 160))));
+    if !note.is_empty() {
+        lines.push(Line::styled(note.to_string(), Style::new().fg(Color::Rgb(255, 120, 90))));
+    }
+    lines.push(Line::styled("↑↓ choose  Enter select  o options  q quit", Style::new().fg(AMBER_DIM)));
+    let w = 60.min(area.width);
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines).centered().wrap(ratatui::widgets::Wrap { trim: false }).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(AMBER))
+                .style(Style::new().bg(Color::Rgb(16, 11, 4))),
+        ),
+        r,
+    );
+}
+
+/// The options: every setting, left and right to change.
+pub fn draw_options(f: &mut Frame, bg: &Game, rows: &[(String, String)], cursor: usize) {
+    backdrop(f, bg);
+    let area = f.area();
+    let w = 56.min(area.width);
+    let h = area.height.saturating_sub(2).min(rows.len() as u16 + 4);
+    let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
+    let room = h.saturating_sub(4) as usize;
+    let first = cursor.saturating_sub(room.saturating_sub(1)).min(rows.len().saturating_sub(room));
+    let mut lines = Vec::new();
+    for (i, (label, value)) in rows.iter().enumerate().skip(first).take(room) {
+        let sel = i == cursor;
+        let style = if sel { Style::new().fg(Color::Black).bg(AMBER).add_modifier(Modifier::BOLD) } else { Style::new().fg(AMBER) };
+        let shown = if value.is_empty() { String::new() } else if sel { format!("◀ {value} ▶") } else { value.clone() };
+        let inner = w.saturating_sub(4) as usize;
+        let pad = inner.saturating_sub(label.chars().count() + shown.chars().count());
+        lines.push(Line::styled(format!("{label}{}{shown}", " ".repeat(pad)), style));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled("↑↓ choose  ←→ change  Esc back (saved)", Style::new().fg(AMBER_DIM)));
+    f.render_widget(Clear, r);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .border_type(BorderType::Rounded)
+                .title(" Options ")
+                .border_style(Style::new().fg(AMBER))
+                .style(Style::new().bg(Color::Rgb(16, 11, 4))),
+        ),
+        r,
+    );
 }
 
 /// The shop: one player at a time, weapons or accessories.

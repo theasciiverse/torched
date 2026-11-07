@@ -4,18 +4,31 @@ Artillery on destructible ground, a total conversion of Xscorch (Justin David Sm
 Jacob Luna Lundberg, 2000 to 2009; GPL-2.0-only), itself a free remake of Scorched Earth
 (Wendell Hicken, 1991). Rust + Ratatui, the playfield in Braille.
 
-**Status** (2026-11-07): 0.1.0 to 0.4.0 written, not yet played by a person: terrain,
+**Status** (2026-11-07): 0.1.0 to 0.5.0 written, not yet played by a person: terrain,
 hot-seat aiming, the whole arsenal, wind, air, walls, the shop, money, accessories and
-shields, play orders and all-fire-at-once, the seven computer players and `--demo`.
-`--free` gives the old sandbox (every weapon free, no shop). Built from scratch in Rust (David, 2026-11-06), not as a fork of Gorched.
+shields, play orders and all-fire-at-once, the seven computer players and `--demo`,
+skies, effects and synthesised sound, a title screen and remembered options, mouse and
+gamepad. `--free` gives the old sandbox (every weapon free, no shop). The catalog entry
+is written in `../hub/catalog/torched.{toml,md}`, not committed there. Built from scratch in Rust (David, 2026-11-06), not as a fork of Gorched.
 Build order in `ROADMAP.md`.
 
 Code: `src/land.rs` (terrain generators, falling dirt, liquid spills), `src/physics.rs`
 (flight, wind, drag, walls), `src/defs.rs` (Xscorch's `.def` format), `src/weapons.rs`
 and `src/economy.rs` (read `data/*.def`: weapons, accessories, scorings, prices),
 `src/sim.rs` (the game, no terminal), `src/kit.rs` (shop, money, shields and other
-accessories, also `impl Game`), `src/ai.rs` (computer players, also `impl Game`), `src/render.rs` (Braille field, HUD, shop), `src/main.rs`. Session log
+accessories, also `impl Game`), `src/ai.rs` (computer players, also `impl Game`),
+`src/fx.rs` (skies, particles, flash, shake, sound cues), `src/sound.rs` (rodio,
+synthesised), `src/menu.rs` (title, options, saved to `~/.config/torched/options.toml`),
+`src/input.rs` (gamepads via gilrs, mapped to keys), `src/render.rs` (Braille field, HUD, shop), `src/main.rs`. Session log
 at `~/.local/state/torched/session.log`, level from `TORCHED_LOG`.
+With no options `torched` opens on the title, computers playing behind it; any game option
+on the command line, or `--demo`, starts a game directly (and `q` then quits rather than
+returning to the title).
+
+Preview: `asciiverse/torched.cast`, recorded headless at 100x30 per `hub/RECORDING.md`
+with `torched --demo --seed 50 --cash 300000 --mute --for 48` (seed 50 picked by
+`ai::preview`, an ignored search for lively seeds).
+
 Measurements, not checks (`cargo test --release <name> -- --ignored --nocapture`):
 `sim::timing` times every weapon's turn, `ai::timing` the length and outcome of demo
 rounds, `ai::accuracy` each computer player's first-shot hit rate.
@@ -57,6 +70,9 @@ Found in the source while building 0.1.0:
   When only computers are left and no tank loses life for six turns each, the round is a
   stalemate. `--demo` uses Chooser, Calculater, Annihilater and Insanity: about a minute
   a round, five rounds in six won.
+- Skies are Xscorch's two, Night (default, as there) and Fire, with its gradient colours
+  toned down for the terminal. The ground stays Torched's amber-brown, not Xscorch's
+  green. Terrain is random each round by default (Xscorch defaults to Traditional).
 - Defaults as in Xscorch: wrap walls, wind up to 0.05 changing every turn. With wrap
   walls, blasts, spills and damage wrap around the edges too.
 

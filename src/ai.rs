@@ -1076,3 +1076,44 @@ mod accuracy {
         }
     }
 }
+
+#[cfg(test)]
+mod preview {
+    use super::*;
+    use crate::sim::Config;
+    use crate::sim::tests::game_with;
+
+    /// A search, not a check: seeds whose first 48 seconds have the most
+    /// going on, for the catalog recording.
+    #[test]
+    #[ignore]
+    fn lively_seeds() {
+        let mut scored = Vec::new();
+        for seed in 0..60u64 {
+            let mut g = game_with(0, |c| {
+                *c = Config {
+                    players: 0,
+                    ai: vec![AiKind::Chooser, AiKind::Calculater, AiKind::Annihilater, AiKind::Insanity],
+                    seed,
+                    cash: 300_000,
+                    ..Config::default()
+                }
+            });
+            let (mut big, mut deaths, mut seen) = (0, 0, std::collections::HashSet::new());
+            for _ in 0..(48 * 60) {
+                g.tick();
+                for b in &g.blasts {
+                    if b.age == 1 && b.radius >= 60.0 && seen.insert((b.x as i64, b.y as i64, b.radius as i64)) {
+                        big += 1;
+                    }
+                }
+                deaths = g.tanks.iter().filter(|t| !t.alive).count().max(deaths);
+            }
+            scored.push((big + 4 * deaths, seed, big, deaths));
+        }
+        scored.sort();
+        for s in scored.iter().rev().take(8) {
+            println!("seed {:>3}: big blasts {}, deaths {}", s.1, s.2, s.3);
+        }
+    }
+}
