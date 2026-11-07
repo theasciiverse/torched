@@ -309,6 +309,12 @@ impl Session {
     /// A command from this keyboard.
     pub fn submit(&mut self, tank: usize, cmd: Cmd) {
         if self.link.host {
+            // A second Enter before the first Advance is applied would
+            // send everyone on twice; drop it here, before it is numbered,
+            // so every numbered command applies everywhere.
+            if matches!(cmd, Cmd::Advance { .. }) && self.pending.iter().any(|(_, _, c)| matches!(c, Cmd::Advance { .. })) {
+                return;
+            }
             self.order(tank, cmd);
         } else {
             self.link.all(Msg::Want { tank: tank as u8, cmd });
@@ -364,12 +370,10 @@ impl Session {
             }
         }
         // Apply what the game has reached.
+        // Every numbered command applies, in order, once the game reaches
+        // it: a peer still watching the last shell land waits for the
+        // host's Advance rather than dropping it.
         while let Some((seq, tank, cmd)) = self.pending.front().cloned() {
-            if game.is_stale(&cmd) {
-                self.pending.pop_front();
-                self.last_applied = seq;
-                continue;
-            }
             if !game.can_apply(tank, &cmd) {
                 break;
             }
@@ -484,17 +488,24 @@ mod tests {
     /// other over iroh, and end with the same game.
     #[test]
     fn two_peers_play_a_game_in_step() {
-        play(false);
+        play(false, false);
+    }
+
+    /// The peer runs at half speed, so the host's Advance reaches it while
+    /// its last shell is still in the air (a slow or busy machine).
+    #[test]
+    fn a_slow_peer_keeps_in_step() {
+        play(false, true);
     }
 
     /// The peer's game is knocked out of step; it notices, takes the
     /// host's game, and they finish the same.
     #[test]
     fn a_peer_out_of_step_recovers() {
-        play(true);
+        play(true, false);
     }
 
-    fn play(knock: bool) {
+    fn play(knock: bool, slow: bool) {
         let host = Link::host(true);
         let ticket = wait_for(&host, "the ticket", |e| if let In::Ready { ticket } = e { Some(ticket) } else { None });
         let client = Link::join(&ticket, "Bea".into(), true).unwrap();
@@ -513,15 +524,28 @@ mod tests {
         let mut gc = crate::sim::tests::new_game(cfg);
         let mut sh = Session::new(host, 0, owners.clone());
         let mut sc = Session::new(client, 1, owners);
+        // Each side acts once per (round, turn, phase): Advance can lead
+        // straight into the next Aim, with no phase between to reset on.
         let mut fired = [false, false];
+        let mut seen: [Option<(u32, usize, crate::sim::Phase)>; 2] = [None, None];
         let start = std::time::Instant::now();
         let mut shots = 0;
+        let mut step = 0u64;
         while !(gh.phase == crate::sim::Phase::GameOver && gc.phase == crate::sim::Phase::GameOver) {
-            assert!(start.elapsed() < Duration::from_secs(120), "game didn't finish: {shots} shots, round {}", gh.round);
+            assert!(start.elapsed() < Duration::from_secs(120), "game didn't finish: {shots} shots, round {}, host {:?}, peer {:?}", gh.round, gh.phase, gc.phase);
+            step += 1;
             for (k, (g, s)) in [(&mut gh, &mut sh), (&mut gc, &mut sc)].into_iter().enumerate() {
                 assert!(s.pump(g).is_none());
+                if k == 1 && slow && step % 2 == 0 {
+                    continue;
+                }
                 g.tick();
                 use crate::sim::Phase;
+                let now = Some((g.round, g.turn, g.phase));
+                if seen[k] != now {
+                    seen[k] = now;
+                    fired[k] = false;
+                }
                 match g.phase {
                     Phase::Aim if k == 1 && knock && shots == 3 && g.tanks[0].money != 12345 => {
                         // Corrupt the peer's copy.
@@ -535,15 +559,12 @@ mod tests {
                         fired[k] = true;
                         shots += 1;
                     }
-                    Phase::RoundOver | Phase::GameOver if k == 0 && !fired[k] => {
+                    // At GameOver the host waits, so both games end.
+                    Phase::RoundOver if k == 0 && !fired[k] => {
                         s.submit(0, Cmd::Advance { round: g.round });
                         fired[k] = true;
                     }
-                    Phase::Aim | Phase::RoundOver | Phase::GameOver => {}
-                    _ => fired[k] = false,
-                }
-                if !matches!(g.phase, Phase::Aim | Phase::RoundOver | Phase::GameOver) {
-                    fired[k] = false;
+                    _ => {}
                 }
             }
             std::thread::sleep(Duration::from_micros(300));

@@ -4,13 +4,13 @@ Artillery on destructible ground, a total conversion of Xscorch (Justin David Sm
 Jacob Luna Lundberg, 2000 to 2009; GPL-2.0-only), itself a free remake of Scorched Earth
 (Wendell Hicken, 1991). Rust + Ratatui, the playfield in Braille.
 
-**Status** (2026-11-07): 0.1.0 to 0.6.0 written, not yet played by a person: terrain,
+**Status** (2026-11-07): 0.6.0 released, played by David ("easily good enough to go out"): terrain,
 hot-seat aiming, the whole arsenal, wind, air, walls, the shop, money, accessories and
 shields, play orders and all-fire-at-once, the seven computer players and `--demo`,
 skies, effects and synthesised sound, a title screen and remembered options, mouse and
 gamepad, network play over iroh. 1.0.0 waits on the last roadmap item: balance played
-through against Xscorch, by people. `--free` gives the old sandbox (every weapon free, no shop). The catalog entry
-is in `hub/catalog/torched.{toml,md}`; release workflow in `.github/workflows/release.yml` (tags `vX.Y.Z`). Built from scratch in Rust (David, 2026-11-06), not as a fork of Gorched.
+through against Xscorch, by people. `--free` gives the old sandbox (every weapon free, no shop). In the catalog,
+`hub/catalog/torched.{toml,md}`; release workflow in `.github/workflows/release.yml` (tags `vX.Y.Z`). Built from scratch in Rust (David, 2026-11-06), not as a fork of Gorched.
 Build order in `ROADMAP.md`.
 
 Code: `src/land.rs` (terrain generators, falling dirt, liquid spills), `src/physics.rs`
@@ -83,8 +83,11 @@ Found in the source while building 0.1.0:
   the land bit-packed) and carries on from it. A player who leaves is replaced by a
   Chooser. Tickets are base32 postcard `EndpointAddr`s starting `torched`, so they hold
   direct addresses (`--lan` works with no internet) and, without `--lan`, a relay.
-  All-fire-at-once is off in network games. Tested over real iroh on one machine
-  (`net::tests`), including a forced desync that recovers.
+  All-fire-at-once is off in network games. Only the host sends Advance, and it drops a
+  repeat before numbering it, so peers apply every numbered command and never skip one (a
+  peer still watching the last shell land waits for it; skipping it there once left a slow
+  peer a round behind, found on two-core CI runners). Tested over real iroh on one machine
+  (`net::tests`): in step, a peer at half speed, and a forced desync that recovers.
 - Defaults as in Xscorch: wrap walls, wind up to 0.05 changing every turn. With wrap
   walls, blasts, spills and damage wrap around the edges too.
 

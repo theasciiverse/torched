@@ -43,18 +43,6 @@ impl Game {
         }
     }
 
-    /// A command that can never apply again: a repeated Advance.
-    pub fn is_stale(&self, cmd: &Cmd) -> bool {
-        match cmd {
-            Cmd::Advance { round } => self.round > *round || (self.round == *round && !self.round_done()),
-            _ => false,
-        }
-    }
-
-    fn round_done(&self) -> bool {
-        matches!(self.phase, Phase::RoundOver | Phase::GameOver)
-    }
-
     /// Apply a command for a tank. Call only when `can_apply`.
     pub fn apply(&mut self, tank: usize, cmd: &Cmd) {
         match cmd {
